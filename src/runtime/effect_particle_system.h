@@ -5,6 +5,7 @@
 #include "world/eft_mesh_loader.h"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace phoenix::runtime
@@ -20,15 +21,17 @@ namespace phoenix::runtime
     //
     // Simulation semantics (velocity modes, gravity/attract, color/opacity/
     // scale keyframes, texture-frame animation, blend factors) follow the
-    // effect-renderer reference implementation (github.com/cupsocino/
-    // effect-renderer), which was validated visually against the retail
-    // client. Components with a valid, non-motion-path mesh (EftEffect::
-    // meshIndex) render their actual .3DE geometry (first animation frame
-    // only — vertex-animated meshes are not re-sampled per frame); everything
-    // else renders as a camera/placement-oriented billboard quad.
+    // Godot game's established map-effect path. Components with a valid,
+    // non-motion-path mesh (EftEffect::meshIndex) render and animate their
+    // actual .3DE geometry; everything else renders as a camera/placement-
+    // oriented billboard quad.
     class EffectParticleSystem
     {
     public:
+        // Drops map-owned emitters, particles and CPU draw buffers before a
+        // replacement map starts loading.
+        void release_map_resources();
+
         // (Re)builds emitter placements for the currently loaded map. Safe to
         // call with an empty/unparsed library (clears to no-op state).
         void build(const PhoenixRuntimeState& state);
@@ -127,9 +130,14 @@ namespace phoenix::runtime
             float emitAccumulator{};
             float seed{};
             bool oneShotEmitted{};
+            // World-map emitters use the same shared visual clock, mesh-frame
+            // convention and blend-mode approximation as Godot. Debug/gameplay
+            // spawns retain the native inclusive-frame and exact-blend path.
+            bool ambientMap{};
             // Debug-panel override: forces this emitter's effect to behave as
             // non-looping regardless of its authored `loop` flag.
             bool forceNoLoop{};
+            std::size_t placementIndex{ std::numeric_limits<std::size_t>::max() };
             std::uint32_t spawnCounter{};
             std::vector<Particle> particles;
         };
@@ -149,6 +157,7 @@ namespace phoenix::runtime
         };
 
         void step_emitter(Emitter& emitter, const phoenix::world::EftEffect& effect, float dt);
+        void activate_map_placement(std::size_t placementIndex);
         void spawn_particle(Emitter& emitter, const phoenix::world::EftEffect& effect, float life, float spawnSeconds);
         std::uint32_t select_texture_layer_for(const phoenix::world::EftEffect& effect, float elapsedSeconds) const;
         // The mesh to use for this effect, or nullptr for a billboard quad
@@ -158,6 +167,8 @@ namespace phoenix::runtime
         const phoenix::world::EftLibrary* library_{};
         const std::vector<std::uint32_t>* textureLayers_{};
         const std::vector<phoenix::world::EftMesh>* meshes_{};
+        const std::vector<EffectPlacement>* placements_{};
+        std::vector<std::uint8_t> activePlacements_;
         std::vector<Emitter> emitters_;
         std::vector<DebugSpawn> debugSpawns_;
         std::uint32_t nextDebugSpawnId_{ 1 };

@@ -39,11 +39,11 @@ void main()
     float cp = camera.precomputedTrig.z;
     float sp = camera.precomputedTrig.w;
 
-    float cameraX = cy * delta.x - sy * delta.z;
+    float cameraX = -cy * delta.x + sy * delta.z;
     float yawZ = sy * delta.x + cy * delta.z;
     float cameraY = cp * delta.y - sp * yawZ;
     float cameraZ = sp * delta.y + cp * yawZ;
-    float nearPlane = 2.0;
+    float nearPlane = 0.05;
 
     float fogStart = camera.fogDistances.x;
     float fogEnd = max(fogStart + 1.0, camera.fogDistances.y);

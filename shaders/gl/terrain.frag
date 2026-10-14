@@ -12,6 +12,8 @@ out vec4 outColor;
 
 CAMERA_BLOCK
 
+ENVIRONMENT_FUNCTIONS
+
 layout(binding = 0) uniform sampler2DArray terrainTexture;
 layout(std430, binding = 1) readonly buffer TerrainMap { uint words[]; } terrainMap;
 layout(binding = 2) uniform sampler2DArray lightmapTexture;
@@ -32,9 +34,19 @@ uint terrainMapLoad(uint cx, uint cz, uint mapSide)
     return (word >> ((index & 3u) * 8u)) & 0xFFu;
 }
 
+// World X is the reflected Shaiya source axis.  Control maps, splat masks and
+// dungeon lightmaps remain stored in source order, so convert back only for
+// those lookups (detail-texture UVs intentionally remain in world space).
+vec2 sourceMapUv(vec3 worldPos, float mapSize)
+{
+    float halfMap = mapSize * 0.5;
+    return vec2((halfMap - worldPos.x) / mapSize,
+        (worldPos.z + halfMap) / mapSize);
+}
+
 uint terrainMapLookup(vec3 worldPos, float mapSize, uint mapSide)
 {
-    vec2 uv = (worldPos.xz + mapSize * 0.5) / mapSize;
+    vec2 uv = sourceMapUv(worldPos, mapSize);
     uint cx = clamp(uint(uv.x * float(mapSide - 1u)), 0u, mapSide - 2u);
     uint cz = clamp(uint(uv.y * float(mapSide - 1u)), 0u, mapSide - 2u);
     return terrainMapLoad(cx, cz, mapSide);
@@ -58,7 +70,7 @@ vec3 sampleTerrainLayerGrad(uint layer, vec3 worldPos, vec2 ddxWp, vec2 ddyWp, f
 
 vec3 blendedTerrainColor(vec3 worldPos, float mapSize, uint mapSide)
 {
-    vec2 uv = (worldPos.xz + mapSize * 0.5) / mapSize;
+    vec2 uv = sourceMapUv(worldPos, mapSize);
     vec2 cellF = uv * float(mapSide - 1u) - 0.5;
     ivec2 cell0 = ivec2(floor(cellF));
     vec2 fracC = cellF - vec2(cell0);
@@ -96,7 +108,7 @@ vec3 applyUnderwaterView(vec3 color, vec3 worldPos)
     if (camera.positionYaw.y >= 0.0)
         return color;
 
-    vec3 waterTint = clamp(camera.waterStyle.rgb * 1.25 + vec3(0.02, 0.05, 0.08), 0.0, 1.0);
+    vec3 waterTint = clamp(camera.waterDeepAlpha.rgb * 1.25 + vec3(0.02, 0.05, 0.08), 0.0, 1.0);
     float viewDistance = length(worldPos - camera.positionYaw.xyz);
     float cameraDepth = clamp(-camera.positionYaw.y * 0.10, 0.0, 1.0);
     float pixelDepth = clamp(-worldPos.y * 0.05, 0.0, 1.0);
@@ -105,6 +117,40 @@ vec3 applyUnderwaterView(vec3 color, vec3 worldPos)
 
     vec3 cooled = color * vec3(0.62, 0.82, 1.02);
     return mix(cooled, waterTint, underwaterAmount);
+}
+
+vec3 applyGroundWeather(vec3 color, vec3 worldPosition, vec3 worldNormal)
+{
+    float wetness = camera.groundWeather.x;
+    color *= mix(1.0, 0.55, wetness);
+
+    if (camera.groundWeather.y > 0.0 && wetness > 0.35)
+    {
+        float fill = smoothstep(0.35, 1.0, wetness);
+        float flatEnough = smoothstep(0.88, 1.0, abs(worldNormal.y));
+        float base = texture(environmentNormalNoise,
+            worldPosition.xz * 0.03 + vec2(0.53, 0.19)).a;
+        float detail = texture(environmentNormalNoise,
+            worldPosition.xz * 0.129 + vec2(0.11, 0.83)).a;
+        float maskValue = base + (detail - 0.5) * 0.26;
+        float threshold = mix(0.90, 0.70, fill * camera.groundWeather.y * 2.0);
+        float puddle = smoothstep(threshold, threshold + 0.09, maskValue) * flatEnough;
+        color = mix(color, vec3(0.42, 0.46, 0.48) * 0.35, puddle);
+    }
+
+    float snowCover = camera.groundWeather.z;
+    if (snowCover > 0.0)
+    {
+        float liesFlat = smoothstep(0.55, 0.85, abs(worldNormal.y));
+        float base = texture(environmentNormalNoise, worldPosition.xz * 0.02).a;
+        float detail = texture(environmentNormalNoise,
+            worldPosition.xz * 0.086 + vec2(0.37, 0.61)).a;
+        float maskValue = base + (detail - 0.5) * 0.26;
+        float threshold = mix(0.80, 0.32, snowCover);
+        float cover = smoothstep(threshold, threshold + 0.14, maskValue) * liesFlat;
+        color = mix(color, camera.snowColor.rgb, cover);
+    }
+    return color;
 }
 
 void main()
@@ -119,11 +165,6 @@ void main()
     vec3 color = vec3(0.0);
     float alpha = 1.0;
     bool applyLightmap = true;
-    // Purely a look pass (saturation + a mild warm tint), not lighting —
-    // same formula/values as static_object.frag's assetGrade, so terrain
-    // and map objects read as one consistent style. Skipped for characters
-    // rendered through this shader (isCharacter branch below).
-    bool applyGrade = true;
 
     if (vTextureLayer == 0xFFFFFFFDu && mapSide > 1u)
     {
@@ -131,14 +172,21 @@ void main()
         uint mapWordsPadded = (mapBytes + 3u) >> 2u;
         uint maskFlags = terrainMap.words[mapWordsPadded + 16u];
         uint splatLayerCount = min(terrainMap.words[mapWordsPadded + 17u], 8u);
+        bool compatibilityTerrain = camera.shadowInfo.w > 0.5;
 
-        if (maskFlags != 0u && camera.fogDistances.w > 0.5)
+        if (compatibilityTerrain)
         {
             vec2 ddxWp = dFdx(vWorldPos.xz);
             vec2 ddyWp = dFdy(vWorldPos.xz);
-            float halfMap = mapSize * 0.5;
+            uint centerLayer = terrainMapLookup(vWorldPos, mapSize, mapSide);
+            color = sampleTerrainLayerGrad(centerLayer, vWorldPos, ddxWp, ddyWp, mapSize, mapSide);
+        }
+        else if (maskFlags != 0u && camera.fogDistances.w > 0.5)
+        {
+            vec2 ddxWp = dFdx(vWorldPos.xz);
+            vec2 ddyWp = dFdy(vWorldPos.xz);
             uint sections = uint(camera.fogDistances.z);
-            vec2 worldUv = vec2((vWorldPos.x + halfMap) / mapSize, (vWorldPos.z + halfMap) / mapSize);
+            vec2 worldUv = sourceMapUv(vWorldPos, mapSize);
             uint secX = clamp(uint(worldUv.x * float(sections)), 0u, sections - 1u);
             uint secZ = clamp(uint(worldUv.y * float(sections)), 0u, sections - 1u);
             uint maskBase = sections * sections + (secZ * sections + secX) * 2u;
@@ -170,7 +218,9 @@ void main()
         if (centerLayer == waterLayer)
             color = mix(vec3(0.01, 0.08, 0.34), color * vec3(0.42, 0.70, 1.22), 0.45);
 
-        color *= vLighting;
+        if (!compatibilityTerrain)
+            color = applyGroundWeather(color, vWorldPos, vNormal);
+        color *= environmentMaterialLighting(vNormal, vWorldPos);
     }
     else if (vTextureLayer != 0xFFFFFFFFu)
     {
@@ -179,12 +229,6 @@ void main()
             outColor = vec4(vColor, 0.85);
             return;
         }
-        if (vTextureLayer == 0xFFFFFFFCu)
-        {
-            outColor = vec4(0.0, 0.0, 0.0, vColor.r);
-            return;
-        }
-
         uint sampleLayer = vTextureLayer;
         bool alphaCutout = false;
         if (sampleLayer >= 2048u)
@@ -198,22 +242,42 @@ void main()
         if (isWater)
         {
             float t = camera.waterInfo.z;
-            vec2 wp = vWorldPos.xz;
-            vec2 d1 = wp * 0.08 + vec2(t * 0.6, t * 0.3);
-            vec2 d2 = wp * 0.12 + vec2(-t * 0.4, t * 0.5);
-            float ripple = sin(d1.x + d1.y) * 0.5 + sin(d2.x - d2.y) * 0.5;
-            vec3 base = camera.waterStyle.rgb;
-            float highlight = clamp(ripple * 0.4 + 0.5, 0.0, 1.0);
-            vec3 c = mix(base * 0.85, base * 1.15, highlight);
-            c += vec3(0.04, 0.06, 0.08) * highlight * highlight;
+            vec2 worldUv = vWorldPos.xz;
+            float rippleScale = camera.waterSurface.x;
+            float rippleSpeed = camera.waterSurface.y;
+            vec2 uvA = worldUv * rippleScale + vec2(1.0, 0.35) * t * rippleSpeed;
+            vec2 uvB = worldUv * rippleScale * 1.43
+                + vec2(-0.6, 0.8) * t * rippleSpeed * 0.7;
+            vec3 rippleMap = mix(texture(environmentNormalNoise, uvA).rgb,
+                texture(environmentNormalNoise, uvB).rgb, 0.5);
+            vec3 tangentRipple = rippleMap * 2.0 - 1.0;
+            vec3 rippleNormal = normalize(vec3(tangentRipple.x * camera.waterSurface.z,
+                max(tangentRipple.z, 0.15), tangentRipple.y * camera.waterSurface.z));
+
+            vec3 viewDirection = normalize(camera.positionYaw.xyz - vWorldPos);
+            float fresnel = pow(1.0 - clamp(dot(vec3(0.0, 1.0, 0.0), viewDirection), 0.0, 1.0),
+                camera.waterSurface.w);
+            vec3 reflectedDirection = reflect(-viewDirection, rippleNormal);
+            vec3 reflectedSky = environmentSkyRadiance(reflectedDirection);
+
+            // The direct-to-window backend has no sampleable scene depth. A
+            // stable midpoint keeps the shallow/deep palette without a second
+            // rendering pass or a framebuffer copy.
+            float depthFade = 0.55;
+            vec3 c = mix(camera.waterShallowAlpha.rgb, camera.waterDeepAlpha.rgb, depthFade);
+            c = mix(c, reflectedSky, clamp(0.18 + fresnel * 0.62, 0.0, 0.82));
+            float alpha = mix(camera.waterShallowAlpha.w, camera.waterDeepAlpha.w, depthFade);
+            alpha = mix(alpha, 1.0, fresnel * camera.waterOptics.x);
             if (camera.positionYaw.y < 0.0)
             {
                 float depth = clamp(-camera.positionYaw.y * 0.10, 0.0, 1.0);
-                c = mix(c * vec3(0.70, 0.92, 1.18), base * 1.45 + vec3(0.02, 0.05, 0.08), 0.45 + depth * 0.25);
-                outColor = vec4(clamp(c, 0.0, 1.0), clamp(camera.waterStyle.a + 0.18 + depth * 0.16, 0.0, 1.0));
+                c = mix(c * vec3(0.70, 0.92, 1.18), camera.waterDeepAlpha.rgb * 1.45
+                    + vec3(0.02, 0.05, 0.08), 0.45 + depth * 0.25);
+                alpha = mix(camera.waterShallowAlpha.w, camera.waterDeepAlpha.w, camera.waterOptics.y);
+                outColor = vec4(clamp(c, 0.0, 1.0), clamp(alpha, 0.0, 1.0));
                 return;
             }
-            outColor = vec4(c, camera.waterStyle.a);
+            outColor = vec4(clamp(c, 0.0, 1.0), clamp(alpha, 0.0, 1.0));
             return;
         }
         else
@@ -223,71 +287,33 @@ void main()
             bool isCharacter = (vColor.r < 0.01 && vColor.g < 0.01 && vColor.b < 0.05);
             if (isCharacter)
             {
-                applyGrade = false;
                 bool flatLit = vColor.b > 0.01;
                 if (alphaCutout && textureColor.a - 0.08 < 0.0)
                     discard;
-                color = textureColor.rgb;
-                float luma = dot(color, vec3(0.299, 0.587, 0.114));
-                color = clamp(mix(vec3(luma), color, camera.tuning0.w), 0.0, 1.0);
-
-                vec3 charLightDir = vec3(-0.33, 0.80, -0.26);
-                vec3 keyColor = camera.tuning0.rgb;
-                vec3 ambientGround = camera.tuning1.rgb;
-                vec3 ambientSky = camera.tuning2.rgb;
-                vec3 weatherTint = vec3(camera.tuning3.z) + camera.tuning3.w * skyColor;
-                vec3 lit;
-                if (flatLit)
-                {
-                    vec3 ambient = mix(ambientGround, ambientSky, 0.65) * weatherTint;
-                    lit = color * (ambient + 0.68 * camera.tuning1.w * keyColor);
-                }
-                else
-                {
-                    vec3 n = normalize(vNormal);
-                    float nDotL = dot(n, charLightDir);
-                    float diffuse = clamp(nDotL, 0.0, 1.0);
-                    // Player character reverted to plain diffuse (no wrap,
-                    // no specular/rim) — the enhanced look read wrong on
-                    // the player specifically, even though the identical
-                    // formula was kept for monsters/NPCs (skinned_character.
-                    // frag) and reads fine there. Hardcoded here (rather
-                    // than reverting camera.tuning2.w/tuning3.xy) so this
-                    // stays decoupled from characterShading, which
-                    // skinned_character.frag's isCharacter branch still
-                    // relies on.
-                    float shade = diffuse;
-
-                    float hemi = n.y * 0.5 + 0.5;
-                    vec3 ambient = mix(ambientGround, ambientSky, hemi) * weatherTint;
-
-                    lit = color * (ambient + shade * camera.tuning1.w * keyColor);
-                }
-
-                if (!alphaCutout)
-                    color = clamp(lit + color * textureColor.a * 0.30, 0.0, 1.0);
-                else
-                    color = clamp(lit, 0.0, 1.0);
+                // Cloaks intentionally use a constant term because their
+                // simulation rebuilds normals every frame. All other player
+                // parts use the same neutral Lambert result as the world.
+                vec3 lighting = flatLit ? vec3(0.75) : environmentMaterialLighting(vNormal, vWorldPos);
+                color = textureColor.rgb * lighting;
                 applyLightmap = false;
             }
             else
             {
                 if (alphaCutout && textureColor.a - 0.3 < 0.0)
                     discard;
-                color = textureColor.rgb * vLighting;
+                color = textureColor.rgb * environmentMaterialLighting(vNormal, vWorldPos);
             }
         }
     }
     else
     {
-        color = vColor;
+        color = vColor * environmentMaterialLighting(vNormal, vWorldPos);
     }
 
     if (applyLightmap && camera.fogDistances.w > 0.5)
     {
-        float halfMap = mapSize * 0.5;
         uint sections = uint(camera.fogDistances.z);
-        vec2 worldUv = vec2((vWorldPos.x + halfMap) / mapSize, (vWorldPos.z + halfMap) / mapSize);
+        vec2 worldUv = sourceMapUv(vWorldPos, mapSize);
         uint secX = clamp(uint(worldUv.x * float(sections)), 0u, sections - 1u);
         uint secZ = clamp(uint(worldUv.y * float(sections)), 0u, sections - 1u);
         uint layer = secZ * sections + secX;
@@ -296,20 +322,8 @@ void main()
         color *= lm;
     }
 
-    if (applyGrade)
-    {
-        float luma = dot(color, vec3(0.299, 0.587, 0.114));
-        color = clamp(mix(vec3(luma), color, 1.12) * vec3(1.03, 1.00, 0.97), 0.0, 1.0);
-    }
-
     color = applyUnderwaterView(color, vWorldPos);
     color = mix(color, skyColor, vFogFactor);
-
-    // Subtle screen-space vignette — pure framing/aesthetic, applied last so
-    // it darkens the final composited pixel (fog included) uniformly.
-    vec2 screenUv = gl_FragCoord.xy * camera.screenInfo.zw;
-    float vignette = 1.0 - smoothstep(0.4, 1.0, length(screenUv - 0.5) * 1.35);
-    color *= mix(0.55, 1.0, vignette);
 
     // Dither at the very end, after every other color operation, so it
     // breaks up banding in the final quantized-to-8-bit output.

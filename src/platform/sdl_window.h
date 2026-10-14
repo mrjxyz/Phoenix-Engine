@@ -25,9 +25,13 @@ namespace phoenix::platform
         void hide();
         bool is_key_down(int key) const;
         bool is_mouse_button_down(int button) const;
+        bool mouse_button_pressed(int button) const;
+        int mouse_wheel_delta() const { return mouseWheelDelta_; }
         std::pair<int, int> consume_mouse_delta();
         int consume_mouse_wheel_delta();
         std::pair<int, int> mouse_position() const;
+        void set_relative_mouse_mode(bool enabled);
+        void warp_mouse(int x, int y);
         std::pair<int, int> client_size() const;
         bool is_minimized() const { return minimized_; }
         bool consume_restore_event();
@@ -45,9 +49,11 @@ namespace phoenix::platform
         SDL_GLContext glContext_{};
         std::array<bool, SDL_NUM_SCANCODES> keys_{};
         std::array<bool, 5> mouseButtons_{};
+        std::array<bool, 5> mouseButtonsPressed_{};
         int lastMouseX_{};
         int lastMouseY_{};
         bool hasMousePosition_{};
+        bool relativeMouseMode_{};
         int mouseDeltaX_{};
         int mouseDeltaY_{};
         int mouseWheelDelta_{};

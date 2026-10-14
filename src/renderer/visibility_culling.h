@@ -44,16 +44,14 @@ namespace phoenix::renderer
         std::vector<TerrainDrawRange>& ranges,
         const phoenix::runtime::PhoenixRuntime& runtime,
         const CameraView& view,
-        const phoenix::runtime::PhoenixRuntime::TerrainLodInfo& lod);
+        const phoenix::runtime::PhoenixRuntime::TerrainLodInfo& lod,
+        bool compatibilityTerrain);
 
     void sort_scene_front_to_back(
         phoenix::runtime::StaticObjectScene& scene,
         float camX,
         float camY,
         float camZ);
-
-    std::vector<BatchBoundsGpu> extract_gpu_bounds(
-        const phoenix::runtime::StaticObjectScene& scene);
 
     void build_visible_object_batches(
         const phoenix::runtime::StaticObjectScene& scene,

@@ -7,8 +7,6 @@
 #include <vector>
 
 struct SDL_Window;
-struct ImFont;
-
 namespace phoenix::renderer
 {
     struct DdsTexture;
@@ -80,18 +78,65 @@ namespace phoenix::renderer
         std::int32_t destinationBlend{};
     };
 
-    struct BatchBoundsGpu
-    {
-        float x{};
-        float y{};
-        float z{};
-        float radius{};
-    };
-
     struct TerrainDrawRange
     {
         std::uint32_t firstIndex{};
         std::uint32_t indexCount{};
+    };
+
+    struct ScreenLabel
+    {
+        float centerX{};
+        float topY{};
+        std::string text;
+        std::uint8_t color[4]{ 255, 255, 255, 255 };
+    };
+
+    enum class ScreenUiCommandKind : std::uint8_t
+    {
+        Rectangle,
+        Text,
+    };
+
+    struct ScreenUiCommand
+    {
+        ScreenUiCommandKind kind{ ScreenUiCommandKind::Rectangle };
+        float x{}, y{}, width{}, height{};
+        float color[4]{ 1.0f, 1.0f, 1.0f, 1.0f };
+        // Zero clip size means the entire viewport.
+        float clipX{}, clipY{}, clipWidth{}, clipHeight{};
+        std::string text;
+    };
+
+    // Sky, cloud and water values shared by the full-screen sky and terrain
+    // shaders. Each member is one std140 vec4 so the structure can be copied
+    // directly behind the camera block without fragile per-field packing.
+    struct EnvironmentStyle
+    {
+        float horizonCurve[4]{};       // horizon rgb, sky curve
+        float zenithMidWeight[4]{};    // zenith rgb, intermediate-band weight
+        float midHeight[4]{};          // intermediate-band rgb, band height
+        float groundCloudCover[4]{};   // below-horizon rgb, cloud coverage
+        float cloudColorOpacity[4]{};  // lit cloud rgb, opacity
+        float cloudShadeSpeed[4]{};    // shaded cloud rgb, movement speed
+        float cloudShape[4]{};         // scale, softness, churn, curvature
+        float cloudMotion[4]{};        // wind xy, horizon fade, reserved
+        float waterShallowAlpha[4]{};  // shallow rgb, alpha
+        float waterDeepAlpha[4]{};     // deep rgb, alpha
+        float waterSurface[4]{};       // ripple scale/speed/strength, Fresnel power
+        float waterOptics[4]{};        // Fresnel opacity, underside fade, depth distance, roughness
+        float lightDirectionEnergy[4]{}; // direction toward key light xyz, energy
+        float astroDirectionGlow[4]{};   // visible sun/moon direction xyz, halo strength
+        float lightColorShadow[4]{};     // key-light rgb, shadow darkness
+        float ambientColorEnergy[4]{};   // ambient rgb, energy
+        float glowColorFocus[4]{};       // halo rgb, focus exponent
+        float diskColorSize[4]{};        // disk rgb, angular radius in degrees
+        float skyOptics[4]{};            // disk strength, star strength/amount, reserved
+        float starColorDensity[4]{};      // star rgb, cells per sphere axis
+        float reservedEnvironment0[4]{};  // reserved; keeps the camera UBO layout stable
+        float reservedEnvironment1[4]{};  // reserved; keeps the camera UBO layout stable
+        float groundWeather[4]{};         // wetness, puddle amount, snow cover, reserved
+        float snowColor[4]{};             // accumulated-snow rgb, reserved
     };
 
     class OpenGLRenderer
@@ -103,17 +148,16 @@ namespace phoenix::renderer
         ~OpenGLRenderer();
 
         bool initialize(SDL_Window* window, std::uint32_t width, std::uint32_t height);
-        bool initialize_imgui(SDL_Window* window);
-        // Small Arial font for in-world NPC labels (nullptr if Arial wasn't found,
-        // in which case the caller should use the default ImGui font).
-        ImFont* npc_label_font() const { return npcLabelFont_; }
-        void begin_imgui_frame();
-        std::uint64_t upload_imgui_icon_rgba(
-            const std::uint8_t* rgba,
-            std::uint32_t width,
-            std::uint32_t height);
+        // Native screen-space text and UI, drawn after the 3D scene.
+        void set_world_labels(std::vector<ScreenLabel> labels);
+        void set_screen_ui(std::vector<ScreenUiCommand> commands);
+        bool native_ui_available() const;
         bool set_preview_image(std::uint32_t width, std::uint32_t height, const std::vector<std::uint8_t>& bgraPixels);
         void enter_loading_mode();
+        void leave_loading_mode();
+        // Frees buffers and textures owned by the active world before loading
+        // its replacement. Player, bots and debug-effect resources persist.
+        void release_world_resources();
         bool set_terrain_mesh(const std::vector<TerrainVertex>& vertices, const std::vector<std::uint32_t>& indices);
         bool set_water_mesh(const std::vector<TerrainVertex>& vertices, const std::vector<std::uint32_t>& indices);
         bool update_terrain_vertices(const std::vector<TerrainVertex>& vertices);
@@ -134,13 +178,6 @@ namespace phoenix::renderer
             const TerrainVertex* vertices, std::uint32_t firstVertex, std::uint32_t vertexCount);
         bool update_terrain_indices(const std::vector<std::uint32_t>& indices);
         void set_static_object_batches(const std::vector<ObjectBatch>& batches);
-        bool upload_indirect_draw_data(
-            const std::vector<ObjectBatch>& batches,
-            const std::vector<BatchBoundsGpu>& bounds);
-        void update_indirect_draw_data(
-            const std::vector<ObjectBatch>& batches,
-            const std::vector<BatchBoundsGpu>& bounds);
-        bool indirect_draw_ready() const;
         void set_animated_object_batches(const std::vector<ObjectBatch>& batches);
         // Rebuilds the effect-particle draw buffers from scratch; called once
         // per frame from the CPU particle simulation (cheap: particle counts
@@ -197,8 +234,23 @@ namespace phoenix::renderer
         // phase so the caller can keep processing window messages — the
         // upload takes seconds and the app must stay closable throughout.
         bool upload_terrain_textures(const std::vector<DdsTexture>& textures,
-            const std::function<void()>& pump = {});
+            const std::function<void()>& pump = {},
+            std::uint32_t assetFirstLayer = 0,
+            std::uint32_t assetLayerCount = 0);
         bool upload_terrain_texture_layers(std::uint32_t firstLayer, const std::vector<DdsTexture>& textures);
+        // Field props use an independent, fixed-residency array. Their source
+        // DDS files are canonically 256x256; keeping this pool separate avoids
+        // forcing the terrain/character array to the same (larger) resolution.
+        bool configure_streamed_asset_texture_pool(std::uint32_t firstLayer,
+            std::uint32_t layerCount, std::uint32_t width,
+            std::uint32_t height, std::uint32_t mipLevels);
+        bool upload_streamed_asset_texture_layer(std::uint32_t layer, const DdsTexture& texture);
+        std::uint32_t terrain_texture_width() const;
+        std::uint32_t terrain_texture_height() const;
+        std::uint32_t terrain_texture_mip_levels() const;
+        std::uint32_t asset_texture_width() const;
+        std::uint32_t asset_texture_height() const;
+        std::uint32_t asset_texture_mip_levels() const;
         // Dedicated array for the "Effects" debug panel (see effect_particle
         // .frag's high-bit texture-layer convention). Recreates the array
         // wholesale from the full accumulated texture list each call — the
@@ -209,7 +261,12 @@ namespace phoenix::renderer
         void disable_field_lightmaps();
         void set_sky_settings(const float* fogColor, float fogStartDistance, float fogEndDistance, bool hasWorldSky);
         void set_sky_texture_layers(std::uint32_t skyLayer, std::uint32_t primaryCloudLayer, std::uint32_t secondaryCloudLayer);
-        void set_sky_tuning(const float* values, std::uint32_t count);
+        void set_environment_style(const EnvironmentStyle& style);
+        // Switches the field terrain to its one-layer inexpensive shader path.
+        // This is a uniform-only change, so it takes effect without a map reload.
+        void set_terrain_compatibility(bool enabled);
+        void set_shadows_enabled(bool enabled);
+        bool set_vsync_enabled(bool enabled);
         // Live toggle for MSAA + alpha-to-coverage — safe to call every
         // frame regardless of whether the context actually has multisample
         // buffers (glEnable/glDisable(GL_MULTISAMPLE) is a no-op without
@@ -239,6 +296,7 @@ namespace phoenix::renderer
         const std::string& adapter_name() const { return adapterName_; }
         std::uint32_t surface_width() const;
         std::uint32_t surface_height() const;
+        std::uint32_t max_texture_array_layers() const;
         std::uint64_t vram_total_bytes() const;
         std::uint64_t vram_used_bytes() const;
 
@@ -256,7 +314,6 @@ namespace phoenix::renderer
         bool create_static_object_pipeline();
         bool create_effect_particle_pipeline();
         bool create_skinned_character_pipeline();
-        bool create_cull_compute_pipeline();
         bool create_sky_pipeline();
         bool create_descriptor_resources();
         bool create_preview_buffer(std::size_t byteSize);
@@ -264,9 +321,6 @@ namespace phoenix::renderer
         void destroy_swapchain();
 
         bool ready_{};
-        bool imguiReady_{};
-        bool imguiFrameStarted_{};
-        ImFont* npcLabelFont_{};
         std::string adapterName_;
         std::uint32_t graphicsQueueFamily_{ UINT32_MAX };
         std::uint32_t frameIndex_{};

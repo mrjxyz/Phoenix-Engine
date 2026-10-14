@@ -57,8 +57,29 @@ namespace phoenix::character
         // Airborne jumps hold the clip at this fraction; the remainder is the
         // landing tail, played by the touch-down recovery.
         constexpr float kJumpHoldFrameFraction = 0.80f;
-        constexpr float kTerrainFollowResponse = 10.0f;
         constexpr float kPi = 3.1415926535f;
+        constexpr float kBackwardSpeedScale = 0.70f;
+        constexpr float kStrafeSpeedScale = 0.85f;
+        constexpr float kTurnRate = 12.0f;
+        constexpr float kLookTurnRate = 18.0f;
+        constexpr float kZoomResponse = 12.0f;
+        constexpr float kSpecialStepSettleTime = 0.12f;
+        constexpr float kMountedCameraDistanceScale = 1.35f;
+        constexpr float kCameraClearance = 0.35f;
+        constexpr float kCameraPullOutResponse = 4.0f;
+        // Ten fixed ray samples left gaps wider than two metres at maximum
+        // mounted zoom, allowing narrow terrain ridges to be skipped entirely.
+        constexpr float kCameraCollisionSampleSpacing = 0.25f;
+        constexpr int kCameraCollisionMaxSteps = 128;
+        constexpr int kCameraCollisionRefineSteps = 8;
+        constexpr float kCameraCollisionSkin = 0.025f;
+
+        float turn_toward(float current, float desired, float rate, float delta)
+        {
+            float difference = std::remainder(desired - current, 2.0f * kPi);
+            current += difference * std::min(1.0f, rate * delta);
+            return std::remainder(current, 2.0f * kPi);
+        }
 
         // CSV token cleanup (strips trailing '\r' from CRLF files) and Linux-safe
         // case-insensitive path resolution, both delegating to the shared assets
@@ -73,15 +94,6 @@ namespace phoenix::character
             return assets::resolve_existing_path_case_insensitive(path);
         }
 
-        // Read a little-endian uint32 from a raw byte pointer.
-        std::uint32_t read_u32_le(const std::uint8_t* data, std::size_t offset)
-        {
-            return static_cast<std::uint32_t>(data[offset])
-                | (static_cast<std::uint32_t>(data[offset + 1]) << 8)
-                | (static_cast<std::uint32_t>(data[offset + 2]) << 16)
-                | (static_cast<std::uint32_t>(data[offset + 3]) << 24);
-        }
-
         // ---- Minimal math library ----
 
         struct Vec3
@@ -90,6 +102,22 @@ namespace phoenix::character
             float y{};
             float z{};
         };
+
+        // Per-rig corrections from data/mantles/profiles/*.cloth.json in the
+        // Godot game. The native .3dc path already preserves the authored grid
+        // order, so only these profile values are needed by this renderer.
+        std::array<float, 3> cloak_shoulder_offset(std::string_view prefix)
+        {
+            if (prefix == "demf") return { 0.0f,  0.000f, -0.019f };
+            if (prefix == "demr") return { 0.0f, -0.018f, -0.013f };
+            if (prefix == "dewf") return { 0.0f,  0.007f,  0.000f };
+            if (prefix == "dewr") return { 0.0f,  0.009f,  0.000f };
+            if (prefix == "elmr") return { 0.0f,  0.003f,  0.020f };
+            if (prefix == "elwm") return { 0.0f,  0.008f,  0.000f };
+            if (prefix == "elwr") return { 0.0f,  0.011f,  0.000f };
+            if (prefix == "humm") return { 0.0f,  0.004f, -0.013f };
+            return {};
+        }
 
         struct Quat
         {
@@ -749,7 +777,7 @@ namespace phoenix::character
         {
             std::string mesh;
             std::filesystem::path texture;
-            bool alphaCutout;
+            bool alphaCutout{};
         };
 
         std::optional<ResolvedPart> resolve_part_from_table(
@@ -948,6 +976,7 @@ namespace phoenix::character
         const auto animationRoot = resolve_ci(root / "ANI");
 
         data_ = {};
+        cloakShoulderOffset_ = {};
         worldVertices_.clear();
         localSkinned_.clear();
         localSkinnedValid_ = false;
@@ -964,8 +993,8 @@ namespace phoenix::character
         mountAnimationSeconds_ = 0.0f;
         mountActiveAnimation_ = 0;
         mountIdleTimer_ = 0.0f;
-        cameraTerrainLift_ = 0.0f;
-        cameraTerrainLiftInitialized_ = false;
+        collisionCameraDistance_ = cameraDistance_;
+        collisionCameraInitialized_ = false;
 
         // Apply per-character default attach bones (ranged weapons on archer/hunter
         // classes use a different bone). Still overridable live from the UI.
@@ -977,12 +1006,12 @@ namespace phoenix::character
         {
             std::string mesh;
             std::filesystem::path texture;
-            bool alphaCutout;
+            bool alphaCutout{};
         };
 
         // Resolve parts from CSV tables (MLT converted to CSV).
         // Helmet and hair are mutually exclusive: if helmet is visible, hair is hidden.
-        struct PartSpec { std::string_view partFile; int index; };
+        struct PartSpec { std::string_view partFile; int index{}; };
         std::vector<PartSpec> partSpecs{
             { "upper",   appearance.upperIndex },
             { "lower",   appearance.lowerIndex },
@@ -1462,6 +1491,7 @@ namespace phoenix::character
             // Lowercase prefix to match filenames on disk.
             auto lowerPrefix = appearance.prefix;
             for (auto& c : lowerPrefix) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            cloakShoulderOffset_ = cloak_shoulder_offset(lowerPrefix);
 
             const auto bodyFilename    = lowerPrefix + "_mentle_l.3dc";
             const auto bodyFilenameFallback = lowerPrefix + "_mentle_hl.3dc";
@@ -1586,7 +1616,7 @@ namespace phoenix::character
                 const std::string& objects = row[7];
 
                 // Bone: seat bone the rider attaches to, defined per mount in
-                // the CSV (the ImGui "Seat bone" input stays as a live tool).
+                // the CSV (the debug-panel "Seat bone" input stays live).
                 if (row.size() > 8)
                 {
                     try
@@ -1768,7 +1798,7 @@ namespace phoenix::character
         const float clampedDelta = std::clamp(deltaSeconds, 0.0f, 0.05f);
 
         // ---- Camera orbit ----
-        if (input.cameraDrag)
+        if (input.cameraOrbit)
         {
             cameraYaw_ += input.mouseDx * 0.0065f;
             cameraPitch_ += input.mouseDy * 0.0045f;
@@ -1776,7 +1806,8 @@ namespace phoenix::character
         if (input.mouseWheel != 0.0f)
         {
             const float wheelSteps = input.mouseWheel / 120.0f;
-            cameraDistance_ = std::clamp(cameraDistance_ - wheelSteps * 1.15f, 2.6f, 18.0f);
+            targetCameraDistance_ = std::clamp(
+                targetCameraDistance_ - wheelSteps * 1.15f, 1.5f, 18.0f);
         }
         if (input.yawLeft)
             cameraYaw_ -= 1.8f * clampedDelta;
@@ -1787,13 +1818,18 @@ namespace phoenix::character
         if (input.pitchDown)
             cameraPitch_ -= 1.4f * clampedDelta;
         cameraPitch_ = std::clamp(cameraPitch_, -0.54f, 0.08f);
+        cameraDistance_ += (targetCameraDistance_ - cameraDistance_)
+            * (1.0f - std::exp(-kZoomResponse * clampedDelta));
 
         // ---- Movement ----
         const float forwardX = std::sin(cameraYaw_);
         const float forwardZ = std::cos(cameraYaw_);
         const float swimForwardY = std::sin(cameraPitch_);
-        const float rightX = std::cos(cameraYaw_);
-        const float rightZ = -std::sin(cameraYaw_);
+        // The reflected world uses the opposite camera-relative lateral basis.
+        // Animation selection remains semantic (A = left, D = right), while
+        // this basis preserves the established physical travel direction.
+        const float rightX = -std::cos(cameraYaw_);
+        const float rightZ = std::sin(cameraYaw_);
         float moveX = 0.0f;
         float moveY = 0.0f;
         float moveZ = 0.0f;
@@ -1825,6 +1861,39 @@ namespace phoenix::character
         // Block movement while sitting/transitioning or during a dodge.
         const bool movementLocked = sitState_ > 0 || dodgePlayTimer_ > 0.0f;
         const bool moving = !movementLocked && moveLength > 0.001f;
+        const bool backwardsOrSideways = !forwardPressed
+            && (backwardPressed || (leftPressed != rightPressed));
+
+        int specialStepRequest = 0;
+        if (moving && !data_.hasMount && !inWater_)
+        {
+            if (backwardPressed && !leftPressed && !rightPressed)
+                specialStepRequest = 1;
+            else if (leftPressed && !forwardPressed && !backwardPressed)
+                specialStepRequest = 2;
+            else if (rightPressed && !forwardPressed && !backwardPressed)
+                specialStepRequest = 3;
+        }
+        if (specialStepRequest == 0)
+        {
+            specialStepRequest_ = 0;
+            specialStepActive_ = 0;
+            specialStepElapsed_ = 0.0f;
+        }
+        else if (specialStepRequest != specialStepRequest_)
+        {
+            const bool switchingSpecialStep = specialStepActive_ != 0;
+            specialStepRequest_ = specialStepRequest;
+            specialStepElapsed_ = 0.0f;
+            if (!switchingSpecialStep)
+                specialStepActive_ = specialStepRequest;
+        }
+        else
+        {
+            specialStepElapsed_ += clampedDelta;
+            if (specialStepElapsed_ >= kSpecialStepSettleTime)
+                specialStepActive_ = specialStepRequest_;
+        }
 
         // ---- Terrain + water ----
         float groundY = 0.0f;
@@ -1896,19 +1965,28 @@ namespace phoenix::character
             moveX /= moveLength;
             moveY = inWater_ ? moveY / moveLength : 0.0f;
             moveZ /= moveLength;
-            const float speed = data_.hasMount
+            float speed = data_.hasMount
                 ? (input.fast ? kMountFastSpeed : kMountSpeed)
                 : (inWater_ ? kSwimSpeed : (input.fast ? kFastRunSpeed : kRunSpeed));
+            if (!data_.hasMount && !inWater_ && backwardsOrSideways)
+                speed = kRunSpeed * (backwardPressed ? kBackwardSpeedScale : kStrafeSpeedScale);
             characterX_ += moveX * speed * clampedDelta;
             if (inWater_)
                 characterY_ += moveY * speed * clampedDelta;
             characterZ_ += moveZ * speed * clampedDelta;
-            const bool strafingOrBacking = backwardPressed || ((leftPressed || rightPressed) && !forwardPressed);
-            // A mount cannot strafe sideways — it always turns to face the
-            // direction of travel. On foot, strafing/backing keeps facing forward.
-            characterYaw_ = (data_.hasMount || !strafingOrBacking)
-                ? std::atan2(moveX, moveZ)
-                : cameraYaw_;
+            const bool strafingOrBacking = backwardsOrSideways;
+            // Match the Godot controller: forward/diagonal locomotion faces its
+            // real travel direction, while pure back/side steps face the camera.
+            const float desiredYaw = (!data_.hasMount && strafingOrBacking)
+                ? cameraYaw_ : std::atan2(moveX, moveZ);
+            characterYaw_ = turn_toward(characterYaw_, desiredYaw,
+                input.cameraTurn ? kLookTurnRate : kTurnRate, clampedDelta);
+        }
+        else if (!climbing_ && input.cameraTurn)
+        {
+            // RMB-look turns an idle character; LMB-look intentionally does not.
+            characterYaw_ = turn_toward(characterYaw_, cameraYaw_,
+                kLookTurnRate, clampedDelta);
         }
 
         // ---- Collision with world objects ----
@@ -1916,9 +1994,11 @@ namespace phoenix::character
         {
             float adjustedX = characterX_;
             float adjustedZ = characterZ_;
-            const float speed = data_.hasMount
+            float speed = data_.hasMount
                 ? (input.fast ? kMountFastSpeed : kMountSpeed)
                 : (inWater_ ? kSwimSpeed : (input.fast ? kFastRunSpeed : kRunSpeed));
+            if (!data_.hasMount && !inWater_ && backwardsOrSideways)
+                speed = kRunSpeed * (backwardPressed ? kBackwardSpeedScale : kStrafeSpeedScale);
             if (collisionFn_(characterX_, characterZ_,
                 characterX_ - moveX * speed * clampedDelta,
                 characterZ_ - moveZ * speed * clampedDelta,
@@ -2009,20 +2089,11 @@ namespace phoenix::character
             }
             else
             {
-                // Smooth terrain following for both the character model and camera.
-                // Without this the character visibly "jumps" at heightmap cell edges.
-                if (groundInitialized_)
-                {
-                    const float blend = 1.0f - std::exp(-kTerrainFollowResponse * clampedDelta);
-                    characterY_ += (groundY - characterY_) * blend;
-                    // Snap if very close to avoid perpetual micro-drift.
-                    if (std::abs(characterY_ - groundY) < 0.005f)
-                        characterY_ = groundY;
-                }
-                else
-                {
-                    characterY_ = groundY;
-                }
+                // Match the Godot controller: gameplay stays planted exactly on
+                // the sampled floor.  Only the render position and camera target
+                // below are smoothed; smoothing this value as well caused a second,
+                // visible layer of lag while climbing terrain.
+                characterY_ = groundY;
                 groundInitialized_ = true;
             }
         }
@@ -2105,7 +2176,7 @@ namespace phoenix::character
             // (No cancel-on-movement; movement input is simply ignored.)
         }
 
-        // ---- Emote (one-shot from ImGui, 1–10) ----
+        // ---- Emote (one-shot from the debug panel, 1-10) ----
         if (input.debugAnimation > 0
             && input.debugAnimation < data_.animations.size()
             && data_.animations[input.debugAnimation].animation.parsed)
@@ -2243,8 +2314,11 @@ namespace phoenix::character
                 dodgeAnimation_ = data_.dodgeLeftAnimation;
                 dodgePlayTimer_ = kDodgeDuration;
                 dodgeLeftTimer_ = 0.0f;
-                dodgeDirX_ = -std::cos(characterYaw_);
-                dodgeDirZ_ = std::sin(characterYaw_);
+                // Phoenix mirrors Shaiya's source X axis. Match the Godot
+                // controller's world-space dodge vector while keeping the
+                // authored left animation paired with the A key.
+                dodgeDirX_ = std::cos(characterYaw_);
+                dodgeDirZ_ = -std::sin(characterYaw_);
             }
             // Right
             if (!input.right && lastRight_)
@@ -2254,8 +2328,8 @@ namespace phoenix::character
                 dodgeAnimation_ = data_.dodgeRightAnimation;
                 dodgePlayTimer_ = kDodgeDuration;
                 dodgeRightTimer_ = 0.0f;
-                dodgeDirX_ = std::cos(characterYaw_);
-                dodgeDirZ_ = -std::sin(characterYaw_);
+                dodgeDirX_ = -std::cos(characterYaw_);
+                dodgeDirZ_ = std::sin(characterYaw_);
             }
             lastBackward_ = input.backward;
             lastLeft_ = input.left;
@@ -2393,12 +2467,14 @@ namespace phoenix::character
             desiredAnimation = data_.jumpAnimation;
         else if (moving)
         {
-            if (backwardPressed)
+            if (specialStepActive_ == 1)
                 desiredAnimation = data_.backAnimation;
-            else if (leftPressed && !forwardPressed)
+            else if (specialStepActive_ == 2)
                 desiredAnimation = data_.leftAnimation;
-            else if (rightPressed && !forwardPressed)
+            else if (specialStepActive_ == 3)
                 desiredAnimation = data_.rightAnimation;
+            else if (backwardsOrSideways)
+                desiredAnimation = data_.walkAnimation;
             else
                 desiredAnimation = input.fast ? weaponRunAnim() : data_.walkAnimation;
         }
@@ -2863,14 +2939,18 @@ namespace phoenix::character
         worldVertices_.resize(localAnimated.size());
         for (std::size_t i = 0; i < localAnimated.size(); ++i)
         {
-            const float lx = localAnimated[i].position[0];
+            // Match CharacterRig's single root scale(-1, 1, 1). This becomes
+            // visually correct once the camera uses Godot's -X screen-right
+            // basis; applying only one half of that conversion had made the
+            // character appear reversed relative to the rest of the map.
+            const float lx = -localAnimated[i].position[0];
             const float ly = localAnimated[i].position[1];
             const float lz = localAnimated[i].position[2];
             worldVertices_[i].position[0] = lx * cosYaw + lz * sinYaw + smoothX_;
             worldVertices_[i].position[1] = ly - localGroundY + smoothY_ + kGroundClearance;
             worldVertices_[i].position[2] = -lx * sinYaw + lz * cosYaw + smoothZ_;
 
-            const float nx = localAnimated[i].normal[0];
+            const float nx = -localAnimated[i].normal[0];
             const float nz = localAnimated[i].normal[2];
             worldVertices_[i].normal[0] = nx * cosYaw + nz * sinYaw;
             worldVertices_[i].normal[1] = localAnimated[i].normal[1];
@@ -2888,24 +2968,6 @@ namespace phoenix::character
             worldVertices_[i].textureLayer = (baseLayer + textureLayerBase_) + (isCutout ? 2048u : 0u);
         }
 
-        // Cloak pieces get flat lighting in the shader (color.b sentinel): the
-        // simulated cloth re-derives its normals from the sim geometry every
-        // frame, so normal-based lighting makes it shimmer as it sways/turns.
-        // The shoulder is marked too so the whole garment shades as one.
-        if (data_.hasCloak)
-        {
-            auto markFlatLit = [&](const CharacterData::WeaponPart& part) {
-                for (std::uint32_t i = 0; i < part.vertexCount; ++i)
-                {
-                    const auto vi = static_cast<std::size_t>(part.vertexOffset) + i;
-                    if (vi < worldVertices_.size())
-                        worldVertices_[vi].color[2] = 0.02f;
-                }
-            };
-            markFlatLit(data_.cloakBody);
-            markFlatLit(data_.cloakShoulder);
-        }
-
         // ---- Weapon attach-bone world transform (for weapon aura effects) ----
         // Mirrors the item-vertex path: bone matrix -> *kCharacterScale -> (+saddle
         // if mounted) -> yaw rotate + ground offset + world translate. Computed from
@@ -2915,7 +2977,7 @@ namespace phoenix::character
         {
             const auto& boneMatrix = clientFinals[static_cast<std::size_t>(weaponBoneIndex)];
             const Vec3 boneT = mat4_get_translation(boneMatrix);
-            const float lx = boneT.x * kCharacterScale + riderSaddleOffset.x;
+            const float lx = -(boneT.x * kCharacterScale + riderSaddleOffset.x);
             const float ly = boneT.y * kCharacterScale + riderSaddleOffset.y;
             const float lz = boneT.z * kCharacterScale + riderSaddleOffset.z;
 
@@ -2928,6 +2990,7 @@ namespace phoenix::character
             {
                 Vec3 v = transform_normal(boneMatrix, axes[a]);
                 v.x *= kCharacterScale; v.y *= kCharacterScale; v.z *= kCharacterScale;
+                v.x = -v.x;
                 weaponAttachment_.basis[a * 3 + 0] = v.x * cosYaw + v.z * sinYaw;
                 weaponAttachment_.basis[a * 3 + 1] = v.y;
                 weaponAttachment_.basis[a * 3 + 2] = -v.x * sinYaw + v.z * cosYaw;
@@ -2957,7 +3020,7 @@ namespace phoenix::character
 
             const Vec3 originLocal{ dualOffsetPos[0], dualOffsetPos[1], dualOffsetPos[2] };
             const Vec3 boneT = transform_point(boneMatrix, originLocal);
-            const float lx = boneT.x * kCharacterScale + riderSaddleOffset.x;
+            const float lx = -(boneT.x * kCharacterScale + riderSaddleOffset.x);
             const float ly = boneT.y * kCharacterScale + riderSaddleOffset.y;
             const float lz = boneT.z * kCharacterScale + riderSaddleOffset.z;
 
@@ -2971,6 +3034,7 @@ namespace phoenix::character
                 const Vec3 localAxis{ rot[a], rot[3 + a], rot[6 + a] };
                 Vec3 v = transform_normal(boneMatrix, localAxis);
                 v.x *= kCharacterScale; v.y *= kCharacterScale; v.z *= kCharacterScale;
+                v.x = -v.x;
                 dualWeaponAttachment_.basis[a * 3 + 0] = v.x * cosYaw + v.z * sinYaw;
                 dualWeaponAttachment_.basis[a * 3 + 1] = v.y;
                 dualWeaponAttachment_.basis[a * 3 + 2] = -v.x * sinYaw + v.z * cosYaw;
@@ -3009,7 +3073,7 @@ namespace phoenix::character
                 clothRestLeft_.assign(n, 0.0f);
                 for (std::uint32_t i = 0; i < n; ++i)
                 {
-                    for (int a = 0; a < 3; ++a)
+                    for (std::size_t a = 0; a < 3; ++a)
                     {
                         clothWorld_[i * 3 + a] = worldVertices_[off + i].position[a];
                         clothPrev_[i * 3 + a]  = worldVertices_[off + i].position[a];
@@ -3040,7 +3104,6 @@ namespace phoenix::character
                 // local displacement between the cloak's bind position and the body
                 // vertex's bind position; re-added (yaw-rotated) every frame.
                 clothPinBody_.assign(cols, UINT32_MAX);
-                clothPinOffset_.assign(static_cast<std::size_t>(cols) * 3u, 0.0f);
                 // Prefer anchoring to the shoulder piece: both cloak parts are
                 // authored as one garment, so hanging the cloth off the collar
                 // keeps them welded — anchoring to arbitrary body vertices lets
@@ -3072,12 +3135,6 @@ namespace phoenix::character
                         if (d2 < bestDist) { bestDist = d2; bestSlot = slot; }
                     }
                     clothPinBody_[c] = bestSlot;
-                    if (bestSlot != UINT32_MAX)
-                    {
-                        clothPinOffset_[c * 3 + 0] = cx - data_.bindVertices[bestSlot].position[0];
-                        clothPinOffset_[c * 3 + 1] = cy - data_.bindVertices[bestSlot].position[1];
-                        clothPinOffset_[c * 3 + 2] = cz - data_.bindVertices[bestSlot].position[2];
-                    }
                 }
                 clothInitialized_ = true;
             }
@@ -3095,9 +3152,11 @@ namespace phoenix::character
                 float px, py, pz;
                 if (slot != UINT32_MAX && slot < worldVertices_.size())
                 {
-                    const float ox = clothPinOffset_[c * 3 + 0];
-                    const float oy = clothPinOffset_[c * 3 + 1];
-                    const float oz = clothPinOffset_[c * 3 + 2];
+                    // ClothSim.PIN_SEAM is zero in Godot: discard the fixed
+                    // authored gap and retain only the per-rig profile offset.
+                    const float ox = -cloakShoulderOffset_[0];
+                    const float oy = cloakShoulderOffset_[1];
+                    const float oz = cloakShoulderOffset_[2];
                     px = worldVertices_[slot].position[0] + (ox * pinCos + oz * pinSin);
                     py = worldVertices_[slot].position[1] + oy;
                     pz = worldVertices_[slot].position[2] + (-ox * pinSin + oz * pinCos);
@@ -3180,7 +3239,7 @@ namespace phoenix::character
                         const float s = kMaxVelStep / std::sqrt(v2);
                         vx *= s; vy *= s; vz *= s;
                     }
-                    for (int a = 0; a < 3; ++a)
+                    for (std::size_t a = 0; a < 3; ++a)
                         clothPrev_[i * 3 + a] = clothWorld_[i * 3 + a];
                     clothWorld_[i * 3 + 0] += vx;
                     clothWorld_[i * 3 + 1] += vy + kGStep;
@@ -3221,69 +3280,31 @@ namespace phoenix::character
                 }
             }
 
-            // Write simulated positions back into the render buffer.
+            // Godot rebuilds the visible mesh every render frame, interpolated
+            // between the previous and current 60 Hz cloth states. Without this
+            // the cape visibly freezes on frames where no fixed step ran.
+            const float renderAlpha = std::clamp(clothAccum_ / kFixedDt, 0.0f, 1.0f);
             for (std::uint32_t i = 0; i < n; ++i)
             {
-                worldVertices_[off + i].position[0] = clothWorld_[i * 3 + 0];
-                worldVertices_[off + i].position[1] = clothWorld_[i * 3 + 1];
-                worldVertices_[off + i].position[2] = clothWorld_[i * 3 + 2];
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    worldVertices_[off + i].position[axis] = std::lerp(
+                        clothPrev_[i * 3 + axis], clothWorld_[i * 3 + axis], renderAlpha);
             }
 
-            // Recompute normals from the actual triangle winding of the cloak mesh
-            // and accumulate per vertex. Using the mesh's own faces (consistent
-            // winding) avoids the orientation flips that produced dark patches.
-            // Reference direction (the world-transformed bind normals) lets us
-            // globally flip if the winding points the opposite way.
-            float refDot = 0.0f;
-            clothRefNormals_.resize(static_cast<std::size_t>(n) * 3u);
+            // Match ClothSim._rebuild_mesh: every vertex in a column uses the
+            // corresponding animated shoulder-anchor normal. Geometry-derived
+            // normals make lighting pulse as the simulated folds move.
             for (std::uint32_t i = 0; i < n; ++i)
             {
-                clothRefNormals_[i * 3 + 0] = worldVertices_[off + i].normal[0];
-                clothRefNormals_[i * 3 + 1] = worldVertices_[off + i].normal[1];
-                clothRefNormals_[i * 3 + 2] = worldVertices_[off + i].normal[2];
-                worldVertices_[off + i].normal[0] = 0.0f;
-                worldVertices_[off + i].normal[1] = 0.0f;
-                worldVertices_[off + i].normal[2] = 0.0f;
-            }
-            for (const auto& face : data_.cloakBody.faces)
-            {
-                const std::uint32_t a = face.indices[0];
-                const std::uint32_t b = face.indices[1];
-                const std::uint32_t cI = face.indices[2];
-                if (a >= n || b >= n || cI >= n) continue;
-                const Vec3 e1{
-                    clothWorld_[b * 3 + 0] - clothWorld_[a * 3 + 0],
-                    clothWorld_[b * 3 + 1] - clothWorld_[a * 3 + 1],
-                    clothWorld_[b * 3 + 2] - clothWorld_[a * 3 + 2] };
-                const Vec3 e2{
-                    clothWorld_[cI * 3 + 0] - clothWorld_[a * 3 + 0],
-                    clothWorld_[cI * 3 + 1] - clothWorld_[a * 3 + 1],
-                    clothWorld_[cI * 3 + 2] - clothWorld_[a * 3 + 2] };
-                const Vec3 fn{
-                    e1.y * e2.z - e1.z * e2.y,
-                    e1.z * e2.x - e1.x * e2.z,
-                    e1.x * e2.y - e1.y * e2.x };
-                for (std::uint32_t k : { a, b, cI })
+                const auto column = i % cols;
+                const auto slot = column < clothPinBody_.size()
+                    ? clothPinBody_[column] : UINT32_MAX;
+                if (slot != UINT32_MAX && slot < worldVertices_.size())
                 {
-                    worldVertices_[off + k].normal[0] += fn.x;
-                    worldVertices_[off + k].normal[1] += fn.y;
-                    worldVertices_[off + k].normal[2] += fn.z;
+                    worldVertices_[off + i].normal[0] = worldVertices_[slot].normal[0];
+                    worldVertices_[off + i].normal[1] = worldVertices_[slot].normal[1];
+                    worldVertices_[off + i].normal[2] = worldVertices_[slot].normal[2];
                 }
-            }
-            for (std::uint32_t i = 0; i < n; ++i)
-                refDot += worldVertices_[off + i].normal[0] * clothRefNormals_[i * 3 + 0]
-                        + worldVertices_[off + i].normal[1] * clothRefNormals_[i * 3 + 1]
-                        + worldVertices_[off + i].normal[2] * clothRefNormals_[i * 3 + 2];
-            const float gsign = (refDot < 0.0f) ? -1.0f : 1.0f;
-            for (std::uint32_t i = 0; i < n; ++i)
-            {
-                const Vec3 nn = normalize_vec3({
-                    worldVertices_[off + i].normal[0] * gsign,
-                    worldVertices_[off + i].normal[1] * gsign,
-                    worldVertices_[off + i].normal[2] * gsign });
-                worldVertices_[off + i].normal[0] = nn.x;
-                worldVertices_[off + i].normal[1] = nn.y;
-                worldVertices_[off + i].normal[2] = nn.z;
             }
         }
     }
@@ -3310,6 +3331,7 @@ namespace phoenix::character
         }
         cloakBodyBoneIndex = source.cloakBodyBoneIndex;
         cloakShoulderBoneIndex = source.cloakShoulderBoneIndex;
+        cloakShoulderOffset_ = source.cloakShoulderOffset_;
         mountBoneIndex = source.mountBoneIndex;
         characterX_ = 0.0f;
         characterY_ = 0.0f;
@@ -3327,8 +3349,11 @@ namespace phoenix::character
         animationBlendDuration_ = 0.0f;
         grounded_ = true;
         groundInitialized_ = false;
-        cameraTerrainLift_ = 0.0f;
-        cameraTerrainLiftInitialized_ = false;
+        collisionCameraDistance_ = cameraDistance_;
+        collisionCameraInitialized_ = false;
+        specialStepRequest_ = 0;
+        specialStepActive_ = 0;
+        specialStepElapsed_ = 0.0f;
         inWater_ = false;
         sitState_ = 0;
         activeEmote_ = 0;
@@ -3347,8 +3372,11 @@ namespace phoenix::character
         smoothY_ = y;
         smoothZ_ = z;
         smoothCameraY_ = y + 1.25f;
-        cameraTerrainLift_ = 0.0f;
-        cameraTerrainLiftInitialized_ = false;
+        collisionCameraDistance_ = cameraDistance_;
+        collisionCameraInitialized_ = false;
+        specialStepRequest_ = 0;
+        specialStepActive_ = 0;
+        specialStepElapsed_ = 0.0f;
         characterYaw_ = yaw;
         cameraYaw_ = yaw;
         verticalVelocity_ = 0.0f;
@@ -3374,56 +3402,94 @@ namespace phoenix::character
     {
         // Third-person orbit camera behind the character.
         // Uses the EMA-smoothed Y to eliminate terrain jitter.
-        const float lookTargetY = smoothCameraY_;
+        float lookTargetY = smoothCameraY_;
         const float dirX = std::cos(cameraPitch_) * std::sin(cameraYaw_);
         const float dirY = std::sin(cameraPitch_);
         const float dirZ = std::cos(cameraPitch_) * std::cos(cameraYaw_);
 
-        x = smoothX_ - dirX * cameraDistance_;
-        y = lookTargetY - dirY * cameraDistance_;
-        z = smoothZ_ - dirZ * cameraDistance_;
-
         yaw = cameraYaw_;
         pitch = cameraPitch_;
 
-        // Smooth terrain avoidance for the orbit camera.
+        const float wantedDistance = cameraDistance_
+            * (data_.hasMount ? kMountedCameraDistanceScale : 1.0f);
+        float unblockedDistance = wantedDistance;
+
+        // Match Godot's camera collision: move toward the character when the
+        // line of sight meets terrain instead of changing the requested angle
+        // by raising the camera. Entry is immediate; recovery is smoothed. Use
+        // a bounded world-space spacing rather than a fixed sample count so a
+        // long zoom cannot jump across a narrow ridge.
         if (heightFn_)
         {
-            constexpr float kCameraClearance = 2.0f;
-            float desiredLift = 0.0f;
-            const float terrainAtCam = heightFn_(x, z, heightUserData_);
-            const float minY = terrainAtCam + kCameraClearance;
-            if (y < minY)
-                desiredLift = std::max(desiredLift, minY - y);
+            // Uphill movement can briefly leave the independently smoothed
+            // look target below a sharp terrain step. The collision ray must
+            // begin in clear space or no shortened distance can be guaranteed
+            // safe, so lift only that exceptional target to the surface skin.
+            lookTargetY = std::max(lookTargetY,
+                heightFn_(smoothX_, smoothZ_, heightUserData_)
+                    + kCameraClearance + kCameraCollisionSkin);
+            const int collisionSteps = std::clamp(
+                static_cast<int>(std::ceil(wantedDistance / kCameraCollisionSampleSpacing)),
+                10, kCameraCollisionMaxSteps);
+            float lastClear = 0.0f;
+            bool blocked = false;
+            const auto clearanceAt = [&](float distance) {
+                const float sampleX = smoothX_ - dirX * distance;
+                const float sampleY = lookTargetY - dirY * distance;
+                const float sampleZ = smoothZ_ - dirZ * distance;
+                return sampleY
+                    - heightFn_(sampleX, sampleZ, heightUserData_)
+                    - kCameraClearance;
+            };
 
-            // Also check midpoint between character and camera to catch ridges.
-            const float midX = (smoothX_ + x) * 0.5f;
-            const float midZ = (smoothZ_ + z) * 0.5f;
-            const float midTerrainY = heightFn_(midX, midZ, heightUserData_) + kCameraClearance;
-            const float midCamY = (lookTargetY + y + desiredLift) * 0.5f;
-            if (midCamY < midTerrainY)
+            for (int step = 1; step <= collisionSteps; ++step)
             {
-                // Ridge between character and camera — push camera up more.
-                const float lift = midTerrainY * 2.0f - lookTargetY - y;
-                desiredLift = std::max(desiredLift, lift);
+                const float distance = wantedDistance
+                    * static_cast<float>(step) / static_cast<float>(collisionSteps);
+                if (clearanceAt(distance) <= 0.0f)
+                {
+                    // Refine the first contact within the final 25 cm sample.
+                    // Retaining the clear side of the interval plus a small
+                    // skin prevents floating-point flicker on the surface.
+                    float clearDistance = lastClear;
+                    float blockedDistance = distance;
+                    for (int refine = 0; refine < kCameraCollisionRefineSteps; ++refine)
+                    {
+                        const float midpoint = (clearDistance + blockedDistance) * 0.5f;
+                        if (clearanceAt(midpoint) > 0.0f)
+                            clearDistance = midpoint;
+                        else
+                            blockedDistance = midpoint;
+                    }
+                    lastClear = std::max(0.0f, clearDistance - kCameraCollisionSkin);
+                    blocked = true;
+                    break;
+                }
+                lastClear = distance;
             }
-
-            const float dt = std::clamp(lastDeltaSeconds_, 0.001f, 0.05f);
-            if (!cameraTerrainLiftInitialized_)
-            {
-                cameraTerrainLift_ = desiredLift;
-                cameraTerrainLiftInitialized_ = true;
-            }
-            else
-            {
-                const float response = desiredLift > cameraTerrainLift_ ? 18.0f : 6.0f;
-                const float blend = 1.0f - std::exp(-response * dt);
-                cameraTerrainLift_ += (desiredLift - cameraTerrainLift_) * blend;
-                if (cameraTerrainLift_ < 0.001f)
-                    cameraTerrainLift_ = 0.0f;
-            }
-            y += cameraTerrainLift_;
+            // Do not force the old 0.75 m minimum through terrain. In an
+            // exceptionally tight concavity the camera may approach the
+            // character further, but it always remains on the visible side.
+            unblockedDistance = blocked ? lastClear : wantedDistance;
         }
+
+        if (!collisionCameraInitialized_)
+        {
+            collisionCameraDistance_ = unblockedDistance;
+            collisionCameraInitialized_ = true;
+        }
+        else if (unblockedDistance < collisionCameraDistance_)
+            collisionCameraDistance_ = unblockedDistance;
+        else
+        {
+            const float dt = std::clamp(lastDeltaSeconds_, 0.001f, 0.05f);
+            collisionCameraDistance_ += (unblockedDistance - collisionCameraDistance_)
+                * (1.0f - std::exp(-kCameraPullOutResponse * dt));
+        }
+
+        x = smoothX_ - dirX * collisionCameraDistance_;
+        y = lookTargetY - dirY * collisionCameraDistance_;
+        z = smoothZ_ - dirZ * collisionCameraDistance_;
     }
 
     int CharacterSystem::animation_bone_count() const

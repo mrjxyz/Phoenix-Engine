@@ -212,14 +212,17 @@ namespace phoenix::runtime
         // (unanimated) vertices" — either no frames, or a single static frame.
         struct MeshSample { std::size_t current{}; std::size_t next{}; float amount{}; bool valid{}; };
 
-        MeshSample sample_mesh_frame_index(const EftMesh& mesh, float tick)
+        MeshSample sample_mesh_frame_index(const EftMesh& mesh, float tick, bool ambientMap = false)
         {
             if (mesh.frames.empty())
                 return { 0, 0, 0.0f, false };
             if (mesh.frames.size() == 1 || mesh.maxKeyframe == 0)
                 return { 0, 0, 0.0f, true };
 
-            const float period = static_cast<float>(mesh.maxKeyframe + 1);
+            // Godot deliberately keeps the older map presampling convention
+            // (maxKeyframe samples), while gameplay uses the native inclusive
+            // convention (maxKeyframe + 1). Keep both paths explicit.
+            const float period = static_cast<float>(mesh.maxKeyframe + (ambientMap ? 0 : 1));
             const float localTick = positive_mod(std::max(0.0f, tick), period);
             const float firstKey = static_cast<float>(mesh.frames.front().key);
             if (localTick < firstKey)
@@ -326,10 +329,10 @@ namespace phoenix::runtime
             std::copy(cameraForward, cameraForward + 3, outForward);
         }
 
-        // Rotation is defined in the object's local frame (spin first, then the
-        // per-spawn initial rotation on top — matches the quaternion composition
-        // order `initial.multiply(spin)` in the effect-renderer reference), with
-        // each axis resolved through the *unrotated* orientation basis.
+        // Rotation is defined in the object's local frame, with each axis
+        // resolved through the unrotated orientation basis. Native EFT uses a
+        // single authored rotation matrix: continuous rotation takes precedence
+        // over the per-spawn initial rotation instead of composing both.
         // rotationSign follows the reference's usesMesh ? 1 : -1.
         void apply_particle_spin(float right[3], float up[3], float forward[3],
             const float origRight[3], const float origUp[3], const float origForward[3],
@@ -344,7 +347,8 @@ namespace phoenix::runtime
                 rodrigues(up, axis, cosA, sinA);
                 rodrigues(forward, axis, cosA, sinA);
             }
-            if (axis_vector(effect.initialRotationAxis, origRight, origUp, origForward, axis))
+            if (!effect.rotationEnabled
+                && axis_vector(effect.initialRotationAxis, origRight, origUp, origForward, axis))
             {
                 const float angle = rotationSign * initialRotation;
                 const float cosA = std::cos(angle), sinA = std::sin(angle);
@@ -369,56 +373,66 @@ namespace phoenix::runtime
 
     void EffectParticleSystem::build(const PhoenixRuntimeState& state)
     {
+        release_map_resources();
         library_ = &state.effectLibrary;
         textureLayers_ = &state.effectTextureLayers;
         meshes_ = &state.effectMeshes;
-        emitters_.clear();
-        // Debug-panel spawns reference indices into the library being
-        // replaced above; a map (re)load invalidates them.
-        debugSpawns_.clear();
-        vertices_.clear();
-        indices_.clear();
-        instances_.clear();
-        batches_.clear();
+        placements_ = &state.effectPlacements;
 
         if (!library_->parsed)
             return;
+        activePlacements_.assign(state.effectPlacements.size(), 0u);
+    }
 
-        emitters_.reserve(state.effectPlacements.size() * 2);
-        for (std::size_t i = 0; i < state.effectPlacements.size(); ++i)
+    void EffectParticleSystem::activate_map_placement(std::size_t i)
+    {
+        if (!library_ || !placements_ || i >= placements_->size())
+            return;
+        const auto& placement = (*placements_)[i];
+        if (placement.sequenceIndex < 0
+            || static_cast<std::size_t>(placement.sequenceIndex) >= library_->sequences.size())
+            return;
+
+        const auto& sequence = library_->sequences[static_cast<std::size_t>(placement.sequenceIndex)];
+        emitters_.reserve(emitters_.size() + sequence.records.size());
+        for (std::size_t r = 0; r < sequence.records.size(); ++r)
         {
-            const auto& placement = state.effectPlacements[i];
-            if (placement.sequenceIndex < 0
-                || static_cast<std::size_t>(placement.sequenceIndex) >= library_->sequences.size())
+            const auto& record = sequence.records[r];
+            if (record.effectId < 0 || static_cast<std::size_t>(record.effectId) >= library_->effects.size())
                 continue;
+            const auto& effect = library_->effects[static_cast<std::size_t>(record.effectId)];
 
-            // A world-placed "effect" is a named sequence, not a single raw
-            // component: expand it into one emitter per record, each
-            // starting after that record's authored delay.
-            const auto& sequence = library_->sequences[static_cast<std::size_t>(placement.sequenceIndex)];
-            for (std::size_t r = 0; r < sequence.records.size(); ++r)
-            {
-                const auto& record = sequence.records[r];
-                if (record.effectId < 0 || static_cast<std::size_t>(record.effectId) >= library_->effects.size())
-                    continue;
-
-                const auto& effect = library_->effects[static_cast<std::size_t>(record.effectId)];
-
-                Emitter emitter{};
-                emitter.effectIndex = record.effectId;
-                std::copy(std::begin(placement.position), std::end(placement.position), std::begin(emitter.origin));
-                std::copy(std::begin(placement.right), std::end(placement.right), std::begin(emitter.right));
-                std::copy(std::begin(placement.up), std::end(placement.up), std::begin(emitter.up));
-                std::copy(std::begin(placement.forward), std::end(placement.forward), std::begin(emitter.forward));
-                emitter.seed = static_cast<float>(i) * 977.0f + static_cast<float>(r) * 131.0f + 1.0f;
-                // Negative until the record's start delay has elapsed (see step_emitter).
-                emitter.elapsed = -std::max(0.0f, record.time);
-                emitter.remainingDuration = effect.emitterDuration;
-                emitter.particles.resize(static_cast<std::size_t>(std::min(effect_particle_count(effect), 300)));
-
-                emitters_.push_back(std::move(emitter));
-            }
+            Emitter emitter{};
+            emitter.effectIndex = record.effectId;
+            emitter.placementIndex = i;
+            std::copy(std::begin(placement.position), std::end(placement.position), std::begin(emitter.origin));
+            std::copy(std::begin(placement.right), std::end(placement.right), std::begin(emitter.right));
+            std::copy(std::begin(placement.up), std::end(placement.up), std::begin(emitter.up));
+            std::copy(std::begin(placement.forward), std::end(placement.forward), std::begin(emitter.forward));
+            emitter.seed = static_cast<float>(i) * 977.0f + static_cast<float>(r) * 131.0f + 1.0f;
+            emitter.ambientMap = true;
+            emitter.elapsed = -std::max(0.0f, record.time);
+            emitter.remainingDuration = effect.emitterDuration;
+            emitter.particles.resize(static_cast<std::size_t>(std::min(effect_particle_count(effect), 300)));
+            emitters_.push_back(std::move(emitter));
         }
+    }
+
+    void EffectParticleSystem::release_map_resources()
+    {
+        library_ = nullptr;
+        textureLayers_ = nullptr;
+        meshes_ = nullptr;
+        placements_ = nullptr;
+        std::vector<std::uint8_t>().swap(activePlacements_);
+        std::vector<Emitter>().swap(emitters_);
+        // Debug spawns reference the map library and are invalid across maps.
+        std::vector<DebugSpawn>().swap(debugSpawns_);
+        nextDebugSpawnId_ = 1;
+        std::vector<phoenix::renderer::TerrainVertex>().swap(vertices_);
+        std::vector<std::uint32_t>().swap(indices_);
+        std::vector<phoenix::renderer::EffectParticleInstance>().swap(instances_);
+        std::vector<phoenix::renderer::EffectParticleBatch>().swap(batches_);
     }
 
     std::uint32_t EffectParticleSystem::spawn_debug_effect(
@@ -590,7 +604,10 @@ namespace phoenix::runtime
             const auto& pathMesh = (*meshes_)[static_cast<std::size_t>(effect.meshIndex)];
             if (pathMesh.parsed && !pathMesh.vertices.empty())
             {
-                const auto sample = sample_mesh_frame_index(pathMesh, spawnSeconds * 30.0f);
+                const float pathTick = emitter.ambientMap
+                    ? std::floor(std::max(0.0f, spawnSeconds) * 30.0f)
+                    : spawnSeconds * 30.0f;
+                const auto sample = sample_mesh_frame_index(pathMesh, pathTick, emitter.ambientMap);
                 float pathPos[3], pathUv[2];
                 sample_mesh_vertex(pathMesh, sample, pathMesh.vertices.size() - 1, pathPos, pathUv);
                 for (int i = 0; i < 3; ++i) p.position[i] += pathPos[i];
@@ -722,6 +739,48 @@ namespace phoenix::runtime
         if (!library_ || !library_->parsed)
             return;
 
+        // Placement metadata stays cheap and resident; emitter/particle state
+        // exists only in a preload ring around the camera and is destroyed
+        // outside a wider hysteresis ring.
+        if (placements_)
+        {
+            const float loadDistance = std::max(96.0f, cullDistance + 48.0f);
+            const float unloadDistance = std::max(loadDistance + 96.0f, loadDistance * 1.3f);
+            const float loadSq = loadDistance * loadDistance;
+            const float unloadSq = unloadDistance * unloadDistance;
+            std::vector<std::pair<float, std::size_t>> activationQueue;
+            for (std::size_t i = 0; i < placements_->size(); ++i)
+            {
+                const auto& placement = (*placements_)[i];
+                const float dx = placement.position[0] - cameraPosition[0];
+                const float dy = placement.position[1] - cameraPosition[1];
+                const float dz = placement.position[2] - cameraPosition[2];
+                const float distanceSq = dx * dx + dy * dy + dz * dz;
+                if (!activePlacements_[i] && distanceSq <= loadSq)
+                {
+                    activationQueue.emplace_back(distanceSq, i);
+                }
+                else if (activePlacements_[i] && distanceSq > unloadSq)
+                {
+                    activePlacements_[i] = 0u;
+                }
+            }
+            std::ranges::sort(activationQueue, {}, &std::pair<float, std::size_t>::first);
+            constexpr std::size_t kPlacementIntegrationsPerFrame = 4;
+            const auto activationCount = std::min(
+                activationQueue.size(), kPlacementIntegrationsPerFrame);
+            for (std::size_t i = 0; i < activationCount; ++i)
+            {
+                const auto placementIndex = activationQueue[i].second;
+                activePlacements_[placementIndex] = 1u;
+                activate_map_placement(placementIndex);
+            }
+            std::erase_if(emitters_, [&](const Emitter& emitter) {
+                return emitter.placementIndex >= activePlacements_.size()
+                    || !activePlacements_[emitter.placementIndex];
+            });
+        }
+
         const float dt = clampf(deltaSeconds, 0.0f, 0.1f);
         const float cullDistanceSq = cullDistance * cullDistance;
 
@@ -741,14 +800,18 @@ namespace phoenix::runtime
             std::int32_t sourceBlend{};
             std::int32_t destinationBlend{};
             bool mirrorTexture{};
+            std::uint64_t emitterOrdinal{};
+            float sortDepth{};
             std::vector<EffectParticleInstance> items;
             bool prebaked{};
             std::vector<TerrainVertex> bakedVertices;
             std::vector<std::uint32_t> bakedIndices;
         };
         std::vector<Bucket> buckets;
+        std::uint64_t emitterOrdinal = 0;
 
         const auto process_emitter = [&](Emitter& emitter) {
+            const auto currentEmitterOrdinal = emitterOrdinal++;
             if (emitter.effectIndex < 0
                 || static_cast<std::size_t>(emitter.effectIndex) >= library_->effects.size())
                 return;
@@ -773,15 +836,26 @@ namespace phoenix::runtime
                 effectPtr = &overridden;
             }
             const auto& effect = *effectPtr;
-            step_emitter(emitter, effect, dt);
+            const auto* mesh = mesh_for(effect);
+            // A .3DE's local draw basis rotates source X/Z by 180 degrees. Its
+            // authored emitter offsets, velocities and forces live in that same
+            // frame. Keep those vectors coherent with the geometry, matching
+            // Godot's _effect_space_vector conversion.
+            EftEffect effectSpace = effect;
+            if (mesh)
+            {
+                for (auto* vector : { effectSpace.emitOrigin, effectSpace.emitPositionSpread,
+                        effectSpace.velocityMin, effectSpace.velocityMax,
+                        effectSpace.acceleration, effectSpace.attractPoint })
+                {
+                    vector[0] = -vector[0];
+                    vector[2] = -vector[2];
+                }
+            }
+            step_emitter(emitter, effectSpace, dt);
             if (emitter.elapsed < 0.0f)
                 return; // still waiting out this record's start delay
 
-            const auto textureLayer = select_texture_layer_for(effect, emitter.elapsed);
-            if (textureLayer == 0xFFFFFFFFu)
-                return;
-
-            const auto* mesh = mesh_for(effect);
             // Real .3DE geometry is authored in its own local space (not a
             // unit quad), so the reference renderer flips rotation sign for
             // mesh particles vs. billboards (usesMesh ? 1 : -1).
@@ -793,26 +867,18 @@ namespace phoenix::runtime
 
             const bool animated = mesh && !mesh->frames.empty();
 
-            Bucket* sharedBucket = nullptr;
-            if (!animated)
-            {
-                auto found = std::find_if(buckets.begin(), buckets.end(), [&](const Bucket& b) {
-                    return !b.prebaked && b.mesh == mesh && b.layer == textureLayer
-                        && b.sourceBlend == effect.sourceBlend && b.destinationBlend == effect.destinationBlend
-                        && b.mirrorTexture == effect.mirrorTexture;
-                });
-                if (found == buckets.end())
-                {
-                    buckets.push_back(Bucket{ mesh, textureLayer, effect.sourceBlend, effect.destinationBlend,
-                        effect.mirrorTexture, {}, false, {}, {} });
-                    found = buckets.end() - 1;
-                }
-                sharedBucket = &*found;
-            }
-
             for (const auto& particle : emitter.particles)
             {
                 if (!particle.active) continue;
+
+                // Map effects in Godot swap the material texture once per
+                // emitter, so every live particle shares the same frame. The
+                // debug/gameplay path intentionally remains particle-local.
+                const float textureSeconds = emitter.ambientMap
+                    ? std::max(0.0f, emitter.elapsed) : particle.age;
+                const auto textureLayer = select_texture_layer_for(effect, textureSeconds);
+                if (textureLayer == 0xFFFFFFFFu)
+                    continue;
 
                 const Color4 color = color_at(effect, particle.age);
                 const float alpha = clampf(color.a, 0.0f, 1.0f);
@@ -841,6 +907,35 @@ namespace phoenix::runtime
                 else
                     for (int i = 0; i < 3; ++i) renderPos[i] = emitter.origin[i] + particle.position[i] + particle.velocity[i];
 
+                const float particleSortDepth =
+                    (renderPos[0] - cameraPosition[0]) * cameraForward[0]
+                    + (renderPos[1] - cameraPosition[1]) * cameraForward[1]
+                    + (renderPos[2] - cameraPosition[2]) * cameraForward[2];
+
+                std::int32_t sourceBlend = effect.sourceBlend;
+                std::int32_t destinationBlend = effect.destinationBlend;
+                if (emitter.ambientMap)
+                {
+                    // StandardMaterial3D exposes blend modes rather than raw
+                    // D3D factors. These are the equivalent GL pairs used by
+                    // Godot's map-effect material selection.
+                    if (effect.destinationBlend == 1)
+                    {
+                        sourceBlend = 4;       // SRC_ALPHA
+                        destinationBlend = 1;  // ONE
+                    }
+                    else if (effect.sourceBlend == 8 || effect.destinationBlend == 2)
+                    {
+                        sourceBlend = 8;       // DST_COLOR
+                        destinationBlend = 0;  // ZERO
+                    }
+                    else
+                    {
+                        sourceBlend = 4;       // SRC_ALPHA
+                        destinationBlend = 5;  // INV_SRC_ALPHA
+                    }
+                }
+
                 EffectParticleInstance instance{};
                 instance.color[0] = clampf(color.r, 0.0f, 4.0f);
                 instance.color[1] = clampf(color.g, 0.0f, 4.0f);
@@ -849,11 +944,15 @@ namespace phoenix::runtime
 
                 if (animated)
                 {
-                    // Sample this particle's own animation tick (matching the
-                    // reference's textureSeconds*30 mesh-tick convention) and
-                    // bake the transformed geometry straight to world space.
-                    const auto sample = sample_mesh_frame_index(*mesh, emitter.elapsed * 30.0f);
-                    Bucket baked{ nullptr, textureLayer, effect.sourceBlend, effect.destinationBlend, effect.mirrorTexture, {}, true, {}, {} };
+                    // Ambient animated meshes share the emitter clock and use
+                    // the integer presampled tick used by Godot. Gameplay/debug
+                    // effects keep smooth particle-local native sampling.
+                    const float meshTick = emitter.ambientMap
+                        ? std::floor(std::max(0.0f, emitter.elapsed) * 30.0f)
+                        : particle.age * 30.0f;
+                    const auto sample = sample_mesh_frame_index(*mesh, meshTick, emitter.ambientMap);
+                    Bucket baked{ nullptr, textureLayer, sourceBlend, destinationBlend,
+                        effect.mirrorTexture, currentEmitterOrdinal, particleSortDepth, {}, true, {}, {} };
                     baked.bakedVertices.reserve(mesh->vertices.size());
                     for (std::size_t v = 0; v < mesh->vertices.size(); ++v)
                     {
@@ -882,12 +981,29 @@ namespace phoenix::runtime
                     continue;
                 }
 
+                auto found = std::find_if(buckets.begin(), buckets.end(), [&](const Bucket& b) {
+                    return !b.prebaked && b.mesh == mesh && b.layer == textureLayer
+                        && b.sourceBlend == sourceBlend && b.destinationBlend == destinationBlend
+                        && b.mirrorTexture == effect.mirrorTexture
+                        && b.emitterOrdinal == currentEmitterOrdinal;
+                });
+                if (found == buckets.end())
+                {
+                    const float emitterSortDepth =
+                        (emitter.origin[0] - cameraPosition[0]) * cameraForward[0]
+                        + (emitter.origin[1] - cameraPosition[1]) * cameraForward[1]
+                        + (emitter.origin[2] - cameraPosition[2]) * cameraForward[2];
+                    buckets.push_back(Bucket{ mesh, textureLayer, sourceBlend, destinationBlend,
+                        effect.mirrorTexture, currentEmitterOrdinal, emitterSortDepth, {}, false, {}, {} });
+                    found = buckets.end() - 1;
+                }
+
                 instance.right[0] = right[0]; instance.right[1] = right[1]; instance.right[2] = right[2];
                 instance.up[0] = up[0]; instance.up[1] = up[1]; instance.up[2] = up[2];
                 instance.forward[0] = forward[0]; instance.forward[1] = forward[1]; instance.forward[2] = forward[2];
                 instance.position[0] = renderPos[0]; instance.position[1] = renderPos[1]; instance.position[2] = renderPos[2];
 
-                sharedBucket->items.push_back(instance);
+                found->items.push_back(instance);
             }
         };
 
@@ -913,6 +1029,26 @@ namespace phoenix::runtime
         library_ = mapLibrary;
         textureLayers_ = mapTextureLayers;
         meshes_ = mapMeshes;
+
+        // Godot's DRAW_ORDER_VIEW_DEPTH sorts particles inside each emitter,
+        // and its transparent pass orders emitter draw items back-to-front.
+        // Keep emitter boundaries above, then reproduce both levels here.
+        for (auto& bucket : buckets)
+        {
+            if (bucket.prebaked)
+                continue;
+            std::stable_sort(bucket.items.begin(), bucket.items.end(), [&](const auto& left, const auto& right) {
+                const auto depth = [&](const EffectParticleInstance& item) {
+                    return (item.position[0] - cameraPosition[0]) * cameraForward[0]
+                        + (item.position[1] - cameraPosition[1]) * cameraForward[1]
+                        + (item.position[2] - cameraPosition[2]) * cameraForward[2];
+                };
+                return depth(left) > depth(right);
+            });
+        }
+        std::stable_sort(buckets.begin(), buckets.end(), [](const Bucket& left, const Bucket& right) {
+            return left.sortDepth > right.sortDepth;
+        });
 
         for (const auto& bucket : buckets)
         {
@@ -955,31 +1091,72 @@ namespace phoenix::runtime
             }
             else
             {
-                const float corners[4][2]{ { -0.5f, -0.5f }, { 0.5f, -0.5f }, { -0.5f, 0.5f }, { 0.5f, 0.5f } };
-                // mirrorTexture components are authored expecting a mirrored,
-                // 3x-tiled sample (UV outside [0,1], relying on
-                // GL_MIRRORED_REPEAT) instead of one stretched copy of the
-                // texture — matches the reference renderer's
-                // createBillboardGeometry(mirrorTexture) UV range.
-                const float mirrorUvs[4][2]{ { -1.0f, 2.0f }, { 1.0f, 2.0f }, { -1.0f, 0.0f }, { 1.0f, 0.0f } };
-                const float plainUvs[4][2]{ { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 0.0f, 0.0f }, { 1.0f, 0.0f } };
-                const auto& uvs = bucket.mirrorTexture ? mirrorUvs : plainUvs;
-                for (int i = 0; i < 4; ++i)
+                if (!bucket.mirrorTexture)
                 {
-                    TerrainVertex vertex{};
-                    vertex.position[0] = corners[i][0];
-                    vertex.position[1] = corners[i][1];
-                    vertex.position[2] = 0.0f;
-                    vertex.color[0] = 1.0f; vertex.color[1] = 1.0f; vertex.color[2] = 1.0f;
-                    vertex.normal[0] = 0.0f; vertex.normal[1] = 0.0f; vertex.normal[2] = 1.0f;
-                    vertex.uv[0] = uvs[i][0]; vertex.uv[1] = uvs[i][1];
-                    vertex.textureLayer = bucket.layer;
-                    vertices_.push_back(vertex);
+                    const float corners[4][2]{
+                        { -0.5f, -0.5f }, { 0.5f, -0.5f }, { -0.5f, 0.5f }, { 0.5f, 0.5f }
+                    };
+                    const float uvs[4][2]{
+                        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 0.0f, 0.0f }, { 1.0f, 0.0f }
+                    };
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        TerrainVertex vertex{};
+                        vertex.position[0] = corners[i][0];
+                        vertex.position[1] = corners[i][1];
+                        vertex.color[0] = 1.0f; vertex.color[1] = 1.0f; vertex.color[2] = 1.0f;
+                        vertex.normal[2] = 1.0f;
+                        vertex.uv[0] = uvs[i][0]; vertex.uv[1] = uvs[i][1];
+                        vertex.textureLayer = bucket.layer;
+                        vertices_.push_back(vertex);
+                    }
+                    const std::uint32_t quadIndices[6]{ 0, 1, 2, 2, 1, 3 };
+                    for (const auto quadIndex : quadIndices)
+                        indices_.push_back(baseVertex + quadIndex);
+                    geometryIndexCount = 6;
                 }
-                const std::uint32_t quadIndices[6]{ 0, 1, 2, 2, 1, 3 };
-                for (const auto quadIndex : quadIndices)
-                    indices_.push_back(baseVertex + quadIndex);
-                geometryIndexCount = 6;
+                else
+                {
+                    // Godot reproduces GL_MIRRORED_REPEAT geometrically because
+                    // its material cannot expose that sampler state. Use the
+                    // same four half-quads here so map and Godot renderers agree
+                    // even though the shared world texture sampler is GL_REPEAT.
+                    for (int tileY = 0; tileY < 2; ++tileY)
+                    {
+                        for (int tileX = 0; tileX < 2; ++tileX)
+                        {
+                            const float x0 = -0.5f + static_cast<float>(tileX) * 0.5f;
+                            const float y0 = -0.5f + static_cast<float>(tileY) * 0.5f;
+                            const float u0 = tileX == 0 ? 1.0f : 0.0f;
+                            const float u1 = tileX == 0 ? 0.0f : 1.0f;
+                            const float v0 = tileY == 0 ? 0.0f : 1.0f;
+                            const float v1 = tileY == 0 ? 1.0f : 0.0f;
+                            const float corners[4][2]{
+                                { x0, y0 }, { x0 + 0.5f, y0 },
+                                { x0, y0 + 0.5f }, { x0 + 0.5f, y0 + 0.5f }
+                            };
+                            const float uvs[4][2]{
+                                { u0, v0 }, { u1, v0 }, { u0, v1 }, { u1, v1 }
+                            };
+                            const auto tileBase = static_cast<std::uint32_t>(vertices_.size());
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                TerrainVertex vertex{};
+                                vertex.position[0] = corners[i][0];
+                                vertex.position[1] = corners[i][1];
+                                vertex.color[0] = 1.0f; vertex.color[1] = 1.0f; vertex.color[2] = 1.0f;
+                                vertex.normal[2] = 1.0f;
+                                vertex.uv[0] = uvs[i][0]; vertex.uv[1] = uvs[i][1];
+                                vertex.textureLayer = bucket.layer;
+                                vertices_.push_back(vertex);
+                            }
+                            const std::uint32_t quadIndices[6]{ 0, 1, 2, 2, 1, 3 };
+                            for (const auto quadIndex : quadIndices)
+                                indices_.push_back(tileBase + quadIndex);
+                        }
+                    }
+                    geometryIndexCount = 24;
+                }
             }
 
             if (geometryIndexCount == 0) continue;

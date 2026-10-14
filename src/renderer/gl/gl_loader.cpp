@@ -3,7 +3,9 @@
 #include <cstring>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #endif
 
@@ -82,6 +84,8 @@ PFNGLDELETEFRAMEBUFFERSPROC glDeleteFramebuffers_;
 PFNGLBINDFRAMEBUFFERPROC glBindFramebuffer_;
 PFNGLFRAMEBUFFERTEXTURE2DPROC glFramebufferTexture2D_;
 PFNGLCHECKFRAMEBUFFERSTATUSPROC glCheckFramebufferStatus_;
+PFNGLDRAWBUFFERPROC glDrawBuffer_;
+PFNGLREADBUFFERPROC glReadBuffer_;
 
 PFNGLDRAWELEMENTSPROC glDrawElements_;
 PFNGLDRAWELEMENTSINSTANCEDPROC glDrawElementsInstanced_;
@@ -241,6 +245,8 @@ namespace phoenix::gl
         GLLOAD(glBindFramebuffer);
         GLLOAD(glFramebufferTexture2D);
         GLLOAD(glCheckFramebufferStatus);
+        GLLOAD(glDrawBuffer);
+        GLLOAD(glReadBuffer);
 
         GLLOAD(glDrawElements);
         GLLOAD(glDrawElementsInstanced);

@@ -14,14 +14,15 @@ namespace phoenix::ui
     enum class WeatherMode
     {
         Default,
+        ClearDay,
         Dawn,
         MidAfternoon,
-        Dusk,
         Sunset,
+        Dusk,
         Night,
         Overcast,
-        Storm,
         Snowstorm,
+        Storm,
     };
 
     // One selectable character preset discovered by scanning the data folder.
@@ -45,6 +46,7 @@ namespace phoenix::ui
     {
         bool loadRequested{};
         bool viewDistanceChanged{};
+        bool terrainCompatibilityChanged{};
         bool characterChanged{};
         bool weatherChanged{};
         int emoteTriggered{};   // 0=none, 1-10=emote number (one-shot)
@@ -81,19 +83,26 @@ namespace phoenix::ui
         float viewDistance,
         WeatherMode weatherMode);
 
-    // Display options persisted via app_settings.h (a custom section inside
-    // the shared imgui.ini).
-    struct DisplaySettings
+    // Graphics options persisted via app_settings.h (a custom section inside
+    // phoenix.ini).
+    struct GraphicsSettings
     {
-        bool characterShadow{ true };
+        bool worldShadows{ true };
+        bool vsyncEnabled{ true };
+        bool terrainCompatibility{};
     };
 
-    // The main ImGui control panel (world map, weather, character).
+    // The native control panel (world map, weather, character).
     UnifiedPanelResult draw_editor_panel(
         const phoenix::runtime::PhoenixRuntime& runtime,
         phoenix::renderer::OpenGLRenderer& renderer,
         bool& fogEnabled,
-        bool& showCharacterShadow,
+        bool& worldShadows,
+        bool& terrainCompatibility,
+        bool& vsyncEnabled,
+        int& fpsCapIndex,
+        bool& antialiasingEnabled,
+        bool antialiasingAvailable,
         bool& playMapSounds,
         bool& playMapMusic,
         float& masterVolume,

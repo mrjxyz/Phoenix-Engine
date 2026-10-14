@@ -136,8 +136,20 @@ namespace phoenix::renderer
         GLuint staticObjectProgram{};
         GLuint skinnedCharacterProgram{};
         GLuint effectParticleProgram{};
+        GLuint worldLabelProgram{};
         GLuint skyProgram{};
+        GLuint shadowTerrainProgram{};
+        GLuint shadowStaticProgram{};
+        GLuint shadowSkinnedProgram{};
         bool skyReady{};
+        bool shadowReady{};
+        bool shadowsEnabled{ true };
+        bool terrainCompatibility{};
+        // Uploading a world progressively flips terrainReady/objectsReady as
+        // individual GPU resources arrive. Keep presentation gated by a
+        // separate state so those partial resources can never replace the
+        // loading screen before the whole initial scene is ready.
+        bool loadingMode{};
         // Tracks the last value passed to set_antialiasing_enabled so the
         // effect-particle draw (which deliberately disables MSAA/alpha-to-
         // coverage around itself — see render_frame) knows what to restore
@@ -154,11 +166,17 @@ namespace phoenix::renderer
         GLuint monsterCharacterVao{};
         GLuint npcCharacterVao{};
         GLuint effectParticleVao{};
+        GLuint worldLabelVao{};
         GLuint emptyVao{}; // for sky (no vertex attribs, gl_VertexID driven)
 
-        // --- camera uniform buffer (matches the old 60-float / 15-vec4 push
-        // constant block; std140, binding = 0) ---
+        // --- camera/environment uniform buffer (19 std140 vec4s, binding 0) ---
         GLuint cameraUbo{};
+        GLuint shadowFramebuffer{};
+        GLuint shadowDepthTexture{};
+        GLuint shadowSampler{};
+        static constexpr std::uint32_t shadowResolution = 2048u;
+        float shadowMatrix[16]{};
+        float shadowInfo[4]{ 0.0f, 1.0f / 2048.0f, 0.0012f, 0.0f };
 
         // --- terrain ---
         GlBuffer terrainVertexBuffer;
@@ -176,6 +194,8 @@ namespace phoenix::renderer
         GlBuffer objectVertexBuffer;
         GlBuffer objectIndexBuffer;
         GlBuffer objectInstanceBuffer;
+        GlBuffer objectIndirectBuffer;
+        std::uint32_t objectIndirectCount{};
         std::vector<ObjectBatch> objectBatches;
         bool objectsReady{};
 
@@ -224,9 +244,25 @@ namespace phoenix::renderer
         std::vector<EffectParticleBatch> effectParticleBatches;
         bool effectParticlesReady{};
 
+        struct WorldLabelGlyph
+        {
+            float x0{}, y0{}, x1{}, y1{};
+            float u0{}, v0{}, u1{}, v1{};
+            float advance{};
+        };
+        GlBuffer worldLabelVertexBuffer;
+        GLuint worldLabelTexture{};
+        std::array<WorldLabelGlyph, 224> worldLabelGlyphs{};
+        std::vector<ScreenLabel> worldLabels;
+        std::vector<ScreenUiCommand> screenUi;
+        bool worldLabelsReady{};
+
         // --- textures ---
         GLuint terrainSampler{};
+        GLuint assetSampler{};
+        GLuint environmentNoiseTexture{};
         GlTexture terrainTextureArray;
+        GlTexture assetTextureArray;
         std::uint32_t terrainTextureLayerCount{};
         std::uint32_t terrainTextureWidth{};
         std::uint32_t terrainTextureHeight{};
@@ -234,6 +270,13 @@ namespace phoenix::renderer
         std::uint32_t terrainTextureFormat{};
         bool terrainTextureCompressed{};
         bool terrainTexturesReady{};
+        bool assetTexturesReady{};
+        std::uint32_t assetTextureFirstLayer{};
+        std::uint32_t assetTextureEndLayer{};
+        std::uint32_t assetTextureWidth{};
+        std::uint32_t assetTextureHeight{};
+        std::uint32_t assetTextureMipLevels{};
+        std::uint32_t assetTextureFormat{};
         std::uint32_t maxImageArrayLayers{ 2048 };
 
         GlBuffer terrainMapBuffer;
@@ -271,15 +314,6 @@ namespace phoenix::renderer
         std::uint32_t previewHeight{};
         bool previewReady{};
 
-        // --- GPU frustum culling: kept as unused stub state, matching the
-        // original Vulkan renderer where upload_indirect_draw_data() early-
-        // returns false permanently ("single indirect buffer is not frame-
-        // safe" — see the comment preserved in opengl_renderer.cpp). Indirect
-        // draw / compute culling is therefore intentionally never exercised;
-        // static objects always draw via the direct per-batch path.
-        bool indirectReady{};
-        std::uint32_t indirectBatchCount{};
-
         // --- GPU timing queries ---
         GLuint timestampQueryBegin[kMaxFramesInFlight]{};
         GLuint timestampQueryEnd[kMaxFramesInFlight]{};
@@ -287,13 +321,6 @@ namespace phoenix::renderer
         float gpuFrameTimeMs{};
         std::uint64_t fragmentInvocations{};
         std::uint64_t vertexInvocations{};
-
-        // --- ImGui ---
-        struct ImguiIconTexture
-        {
-            GLuint texture{};
-        };
-        std::vector<ImguiIconTexture> imguiIconTextures;
 
         float cameraConstants[12]{
             // [0-2] position, [3] yaw, [4] pitch, [5] aspect, [6] tanHalfFov, [7] farPlane
@@ -308,43 +335,32 @@ namespace phoenix::renderer
             0.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 0.0f, 0.0f, 0.0f, // waterInfo: baseLayer, frameCount, time, tileSize
         };
-        float skyTuning[12]{
-            0.62f, 0.0f, 1.0f, 0.0f,
-            1.35f, 0.78f, 0.34f, 0.12f,
-            0.82f, 1.10f, 0.22f, 0.06f,
+        EnvironmentStyle environmentStyle{
+            { 0.76f, 0.85f, 0.94f, 0.24f },
+            { 0.13f, 0.34f, 0.72f, 0.30f },
+            { 0.43f, 0.65f, 0.88f, 0.30f },
+            { 0.30f, 0.28f, 0.26f, 0.30f },
+            { 1.00f, 0.99f, 0.96f, 1.00f },
+            { 0.58f, 0.65f, 0.76f, 0.95f },
+            { 0.34f, 0.46f, 0.25f, 40.0f },
+            { 0.60f, 0.20f, 0.10f, 0.0f },
+            { 0.18f, 0.46f, 0.54f, 0.18f },
+            { 0.025f, 0.13f, 0.27f, 0.94f },
+            { 0.05f, 0.030f, 0.58f, 4.0f },
+            { 0.75f, 0.22f, 6.0f, 0.04f },
+            { -0.4575f, 0.6691f, 0.5855f, 1.18f },
+            { -0.5708f, 0.3746f, 0.7305f, 0.42f },
+            { 1.00f, 0.93f, 0.78f, 0.70f },
+            { 0.54f, 0.62f, 0.74f, 0.48f },
+            { 1.00f, 0.94f, 0.78f, 18.0f },
+            { 1.00f, 0.98f, 0.90f, 0.62f },
+            { 1.05f, 0.0f, 0.014f, 0.0f },
+            { 0.92f, 0.95f, 1.00f, 220.0f },
+            { 0.10f, 0.85f, 0.45f, 0.30f },
+            { 0.35f, 0.25f, 0.85f, 0.06f },
+            { 0.0f, 0.5f, 0.0f, 0.0f },
+            { 0.95f, 0.97f, 1.00f, 0.0f },
         };
-        float waterStyle[4]{ 0.10f, 0.18f, 0.22f, 0.62f }; // natural water tint
-        // tuning2.w (wrap-lighting blend) and tuning3.xy (specular/rim
-        // strength) were 0 — the terrain.frag character-lighting branch
-        // (used by the player, see the terrainProgram+constants character
-        // draw in render_frame) already computed a Blinn-Phong specular
-        // and a Fresnel rim term, but multiplied by zero, so neither ever
-        // actually showed. Turning these on is what makes armor/weapons
-        // pick up a highlight instead of flat diffuse.
-        float characterShading[16]{
-            1.0f, 1.0f, 1.0f, 1.0f,
-            0.56f, 0.56f, 0.56f, 0.72f,
-            0.56f, 0.56f, 0.56f, 0.35f,
-            0.35f, 0.22f, 1.0f, 0.0f,
-        };
-        // tuning0.rgb/.w feed static_object.frag's assetGrade pass (a pure
-        // look pass: saturation via mix(luma,color,w), then an rgb tint
-        // multiply) — was (1,1,1,1), a no-op, until this matched the same
-        // subtle warm/saturated grade added to terrain.frag's plain-terrain
-        // path, so terrain and map objects (trees, rocks, buildings) read
-        // as one consistent style.
-        float assetShading[16]{
-            1.03f, 1.00f, 0.97f, 1.12f,
-            0.50f, 0.50f, 1.7f, 1.0f,
-            0.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 0.0f,
-        };
-        // (screenWidth, screenHeight, 1/w, 1/h) — see common_camera.glsl's
-        // screenInfo. Refreshed every frame in render_frame() from
-        // surfaceWidth/surfaceHeight, so the stored default here never
-        // actually reaches the shader.
-        float screenInfo[4]{ 1920.0f, 1080.0f, 1.0f / 1920.0f, 1.0f / 1080.0f };
-
         std::string adapterName;
     };
 }

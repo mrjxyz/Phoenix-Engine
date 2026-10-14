@@ -8,7 +8,6 @@
 /build-*/
 /dist/
 /.vs/
-/.claude/
 
 # Local runtime data and extracted assets
 /data/
@@ -22,6 +21,7 @@
 *.log
 imgui.ini
 perf_hud.ini
+phoenix.ini
 /diagnostics/
 *.user
 *.suo

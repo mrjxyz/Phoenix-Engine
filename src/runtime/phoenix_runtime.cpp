@@ -9,6 +9,7 @@
 #include "world/mani_loader.h"
 #include "world/wld_loader.h"
 #include "world/water_constants.h"
+#include "world/coordinate_conversion.h"
 
 #include <algorithm>
 #include <array>
@@ -23,7 +24,6 @@
 #include <limits>
 #include <map>
 #include <numbers>
-#include <numeric>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,11 +34,7 @@ namespace phoenix::runtime
     {
         constexpr std::uint32_t kAssetTextureLayerBase = 66;
         constexpr std::uint32_t kAssetCutoutLayerBase = 2048;
-        constexpr std::uint32_t kMaxAssetTextureLayers = 960;
         constexpr float kManiTicksPerSecond = 30.0f;
-        // VANI (vertex-animated decor) render cutoff: an extra distance rule on
-        // top of the universal fog/view distance, same as any other asset.
-        constexpr float kVaniRenderDistance = 200.0f;
 
         inline std::filesystem::path resolve_ci(const std::filesystem::path& path)
         {
@@ -270,97 +266,6 @@ namespace phoenix::runtime
             vertices.push_back(vertex);
         }
 
-        std::uint32_t read_le_u32(const std::vector<std::uint8_t>& data, std::size_t offset)
-        {
-            if (offset + 4 > data.size())
-                return 0;
-            return static_cast<std::uint32_t>(data[offset])
-                | (static_cast<std::uint32_t>(data[offset + 1]) << 8)
-                | (static_cast<std::uint32_t>(data[offset + 2]) << 16)
-                | (static_cast<std::uint32_t>(data[offset + 3]) << 24);
-        }
-
-        std::array<float, 3> rgb565(std::uint16_t value)
-        {
-            return {
-                static_cast<float>((value >> 11) & 0x1F) / 31.0f,
-                static_cast<float>((value >> 5) & 0x3F) / 63.0f,
-                static_cast<float>(value & 0x1F) / 31.0f,
-            };
-        }
-
-        std::array<float, 3> average_dds_bc_color(const std::filesystem::path& path)
-        {
-            auto data = assets::read_file_binary(path);
-            if (data.size() < 128 || read_le_u32(data, 0) != 0x20534444u)
-                return { 0.34f, 0.48f, 0.22f };
-
-            const auto height = read_le_u32(data, 12);
-            const auto width = read_le_u32(data, 16);
-            const auto fourCc = read_le_u32(data, 84);
-            const auto isDxt1 = fourCc == 0x31545844u;
-            const auto isDxt3 = fourCc == 0x33545844u;
-            const auto isDxt5 = fourCc == 0x35545844u;
-            if (width == 0 || height == 0 || (!isDxt1 && !isDxt3 && !isDxt5))
-                return { 0.34f, 0.48f, 0.22f };
-
-            const auto blockBytes = isDxt1 ? 8u : 16u;
-            const auto blocksWide = std::max<std::uint32_t>(1, (width + 3) / 4);
-            const auto blocksHigh = std::max<std::uint32_t>(1, (height + 3) / 4);
-            const auto blockCount = static_cast<std::size_t>(blocksWide) * blocksHigh;
-            const auto payloadOffset = std::size_t{ 128 };
-            if (payloadOffset + blockCount * blockBytes > data.size())
-                return { 0.34f, 0.48f, 0.22f };
-
-            std::array<double, 3> sum{};
-            double samples = 0.0;
-            for (std::size_t block = 0; block < blockCount; ++block)
-            {
-                const auto offset = payloadOffset + block * blockBytes + (isDxt1 ? 0u : 8u);
-                const auto c0 = static_cast<std::uint16_t>(data[offset] | (data[offset + 1] << 8));
-                const auto c1 = static_cast<std::uint16_t>(data[offset + 2] | (data[offset + 3] << 8));
-                const auto a = rgb565(c0);
-                const auto b = rgb565(c1);
-                std::array<std::array<float, 3>, 4> palette{};
-                palette[0] = a;
-                palette[1] = b;
-                if (isDxt1 && c0 <= c1)
-                {
-                    for (std::size_t i = 0; i < 3; ++i)
-                    {
-                        palette[2][i] = (a[i] + b[i]) * 0.5f;
-                        palette[3][i] = palette[2][i];
-                    }
-                }
-                else
-                {
-                    for (std::size_t i = 0; i < 3; ++i)
-                    {
-                        palette[2][i] = (2.0f * a[i] + b[i]) / 3.0f;
-                        palette[3][i] = (a[i] + 2.0f * b[i]) / 3.0f;
-                    }
-                }
-
-                const auto bits = read_le_u32(data, offset + 4);
-                for (std::uint32_t pixel = 0; pixel < 16; ++pixel)
-                {
-                    const auto index = (bits >> (pixel * 2u)) & 0x3u;
-                    sum[0] += palette[index][0];
-                    sum[1] += palette[index][1];
-                    sum[2] += palette[index][2];
-                    samples += 1.0;
-                }
-            }
-
-            if (samples <= 0.0)
-                return { 0.34f, 0.48f, 0.22f };
-            return {
-                static_cast<float>(sum[0] / samples),
-                static_cast<float>(sum[1] / samples),
-                static_cast<float>(sum[2] / samples),
-            };
-        }
-
         std::vector<std::filesystem::path> terrain_detail_paths_for_map(
             const phoenix::assets::DataIndex& assets,
             const phoenix::world::WldAnalysis& world)
@@ -381,6 +286,8 @@ namespace phoenix::runtime
 
     bool PhoenixRuntime::initialize(const std::filesystem::path& executableDir, bool loadDefaultMap)
     {
+        if (!mapLoadScheduler_)
+            mapLoadScheduler_ = std::make_unique<phoenix::app::LoadingScheduler>(phoenix::app::LoadingWorkKind::Cpu);
         state_.dataRoot = find_data_root(executableDir);
         // Placeable entities live in data/entity/ (renamed from Assets/).
         state_.entityRoot = assets::resolve_existing_path_case_insensitive(state_.dataRoot / "entity");
@@ -428,7 +335,7 @@ namespace phoenix::runtime
         };
 
         std::vector<std::filesystem::path> candidates;
-        if (const char* envValue = std::getenv("PHOENIX_ENGINE_DATA"); envValue && envValue[0])
+        if (const char* envValue = std::getenv("PHOENIX_CLIENT_DATA"); envValue && envValue[0])
             candidates.emplace_back(envValue);
 
         const std::filesystem::path parentDirs[] = {
@@ -446,12 +353,12 @@ namespace phoenix::runtime
 
 #ifdef _WIN32
         if (const char* localAppData = std::getenv("LOCALAPPDATA"); localAppData && localAppData[0])
-            candidates.emplace_back(std::filesystem::path(localAppData) / "Phoenix Engine" / "data");
+            candidates.emplace_back(std::filesystem::path(localAppData) / "Phoenix Client" / "data");
         if (const char* programData = std::getenv("PROGRAMDATA"); programData && programData[0])
-            candidates.emplace_back(std::filesystem::path(programData) / "Phoenix Engine" / "data");
+            candidates.emplace_back(std::filesystem::path(programData) / "Phoenix Client" / "data");
 #else
         if (const char* home = std::getenv("HOME"); home && home[0])
-            candidates.emplace_back(std::filesystem::path(home) / ".local" / "share" / "Phoenix Engine" / "data");
+            candidates.emplace_back(std::filesystem::path(home) / ".local" / "share" / "Phoenix Client" / "data");
 #endif
 
         for (const auto& candidate : candidates)
@@ -527,10 +434,30 @@ namespace phoenix::runtime
             camera_.y = floorY + 8.0f; // slightly above floor (eye height)
             camera_.z = centroidZ;
             camera_.pitch = 0.0f;
-            camera_.speed = 40.0f;
+            camera_.speed = 60.0f;
         }
 
         return state_.world.parsed;
+    }
+
+    void PhoenixRuntime::release_world_map_resources()
+    {
+        state_.world = {};
+        std::vector<LoadedWorldAsset>().swap(state_.worldAssets);
+        std::vector<std::filesystem::path>().swap(state_.assetTexturePaths);
+        std::unordered_map<std::string, std::uint32_t>().swap(state_.textureSlotByPath);
+        std::vector<SceneObject>().swap(state_.sceneObjects);
+        state_.waterAnimation = {};
+        state_.effectLibrary = {};
+        std::vector<std::uint32_t>().swap(state_.effectTextureLayers);
+        std::vector<phoenix::world::EftMesh>().swap(state_.effectMeshes);
+        std::vector<EffectPlacement>().swap(state_.effectPlacements);
+        std::unordered_map<std::string, std::uint32_t>().swap(assetTextureLayerCache_);
+        // This cache's keys are map asset paths; retaining them makes it grow
+        // with every visited map despite the content no longer being used.
+        std::unordered_map<std::string, bool>().swap(textureCutoutCache_);
+        camera_ = {};
+        update_status();
     }
 
     void PhoenixRuntime::scan_entity_assets()
@@ -760,7 +687,7 @@ namespace phoenix::runtime
         if (const auto it = state_.textureSlotByPath.find(key); it != state_.textureSlotByPath.end())
             return cacheResult(kAssetTextureLayerBase + cutoutOffset + it->second);
 
-        if (state_.assetTexturePaths.size() >= kMaxAssetTextureLayers)
+        if (state_.assetTexturePaths.size() >= maxAssetTextureLayers_)
             return cacheResult(0xFFFFFFFFu);
 
         const auto slot = static_cast<std::uint32_t>(state_.assetTexturePaths.size());
@@ -832,34 +759,34 @@ namespace phoenix::runtime
             }
         }
 
-        // ---- Pass 1: parse models from disk in parallel (pure, no shared state). ----
+        // Field maps keep only this lightweight catalog at map-load time.
+        // Geometry, collision and texture payloads are installed by the world
+        // streamer as nearby placements become resident. A dungeon is one
+        // indivisible authored DG and continues to load as a single sector.
+        if (!state_.world.isDungeon)
         {
-            std::atomic<std::size_t> nextIdx{ 0 };
-            const auto workerCount = std::min(
-                static_cast<std::size_t>(std::max(1u, std::thread::hardware_concurrency())),
-                std::max<std::size_t>(1, pending.size()));
-            std::vector<std::thread> workers;
-            workers.reserve(workerCount);
-            for (std::size_t w = 0; w < workerCount; ++w)
+            state_.worldAssets.resize(pending.size());
+            for (std::size_t i = 0; i < pending.size(); ++i)
             {
-                workers.emplace_back([&pending, &nextIdx]() {
-                    for (;;)
-                    {
-                        const auto i = nextIdx.fetch_add(1);
-                        if (i >= pending.size()) break;
-                        auto& p = pending[i];
-                        if (p.path.empty()) continue;
-                        if (p.kind == 1)
-                            p.smod = p.key.ends_with(".vani")
-                                ? phoenix::world::load_vani(p.path)
-                                : phoenix::world::load_smod(p.path);
-                        else if (p.kind == 2)
-                            p.dg = phoenix::world::load_dg(p.path);
-                    }
-                });
+                state_.worldAssets[i].name = pending[i].name;
+                state_.worldAssets[i].section = pending[i].sectionName;
+                state_.worldAssets[i].path = pending[i].path;
             }
-            for (auto& worker : workers) worker.join();
         }
+        else
+        {
+
+        // ---- Pass 1: parse models from disk in parallel (pure, no shared state). ----
+        phoenix::app::parallel_for_loading(*mapLoadScheduler_, pending.size(), [&pending](std::size_t i) {
+            auto& p = pending[i];
+            if (p.path.empty()) return;
+            if (p.kind == 1)
+                p.smod = p.key.ends_with(".vani")
+                    ? phoenix::world::load_vani(p.path)
+                    : phoenix::world::load_smod(p.path);
+            else if (p.kind == 2)
+                p.dg = phoenix::world::load_dg(p.path);
+        });
 
         // ---- Pass 1b: pre-warm the texture cutout cache in parallel. The
         // universal transparency decision inspects each texture's alpha
@@ -891,34 +818,15 @@ namespace phoenix::runtime
             }
 
             std::vector<std::pair<std::string, bool>> results(uniqueTextures.size());
-            std::atomic<std::size_t> nextIdx{ 0 };
-            const auto workerCount = std::min(
-                static_cast<std::size_t>(std::max(1u, std::thread::hardware_concurrency())),
-                std::max<std::size_t>(1, uniqueTextures.size()));
-            std::vector<std::thread> workers;
-            workers.reserve(workerCount);
-            for (std::size_t w = 0; w < workerCount; ++w)
-            {
-                workers.emplace_back([&]() {
-                    for (;;)
-                    {
-                        const auto i = nextIdx.fetch_add(1);
-                        if (i >= uniqueTextures.size()) break;
-                        auto path = phoenix::assets::resolve_texture_asset(state_.assets, uniqueTextures[i]);
-                        if (path.empty())
-                            continue;
-                        auto key = phoenix::assets::lower_ascii(path.string());
-                        // Already classified on a previous map: skip the file
-                        // read entirely (concurrent reads of the cache are safe
-                        // — nothing mutates it during this phase).
-                        if (textureCutoutCache_.contains(key))
-                            continue;
-                        results[i].second = phoenix::renderer::dds_file_has_alpha_cutout(path);
-                        results[i].first = std::move(key);
-                    }
-                });
-            }
-            for (auto& worker : workers) worker.join();
+            phoenix::app::parallel_for_loading(*mapLoadScheduler_, uniqueTextures.size(), [&](std::size_t i) {
+                auto path = phoenix::assets::resolve_texture_asset(state_.assets, uniqueTextures[i]);
+                if (path.empty()) return;
+                auto key = phoenix::assets::lower_ascii(path.string());
+                // Concurrent reads are safe while this phase owns no writes.
+                if (textureCutoutCache_.contains(key)) return;
+                results[i].second = phoenix::renderer::dds_file_has_alpha_cutout(path);
+                results[i].first = std::move(key);
+            });
 
             for (auto& [key, cutout] : results)
             {
@@ -958,14 +866,11 @@ namespace phoenix::runtime
         // Each slot is independent; layer/material data comes from pass 2a. ----
         state_.worldAssets.resize(pending.size());
         {
-            std::atomic<std::size_t> nextIdx{ 0 };
-            const auto workerCount = std::min(
-                static_cast<std::size_t>(std::max(1u, std::thread::hardware_concurrency())),
-                std::max<std::size_t>(1, pending.size()));
             const auto buildAsset = [&](std::size_t pi) {
                 auto& p = pending[pi];
                 auto& asset = state_.worldAssets[pi];
                 asset.name = p.name;
+                asset.section = p.sectionName;
                 asset.path = p.path;
                 const bool isVani = p.key.ends_with(".vani");
                 if (!asset.path.empty())
@@ -1070,6 +975,38 @@ namespace phoenix::runtime
                         }
                     }
                 }
+
+                // The decoded SMOD/VANI/DG vertices are still in Shaiya's
+                // left-handed local space.  Reflect local X as well as the
+                // instance origin/basis: this is the same two-boundary
+                // conversion used by the Godot client and keeps every asset
+                // on its authored side of its pivot.  Reflection changes the
+                // triangle determinant, so preserve front-face winding.
+                for (auto& vertex : asset.previewVertices)
+                {
+                    vertex.position[0] = -vertex.position[0];
+                    vertex.normal[0] = -vertex.normal[0];
+                }
+                for (std::size_t i = 0; i + 2 < asset.previewIndices.size(); i += 3)
+                    std::swap(asset.previewIndices[i + 1], asset.previewIndices[i + 2]);
+
+                if (asset.animationFrames)
+                {
+                    for (auto& frame : *asset.animationFrames)
+                    {
+                        for (auto& vertex : frame)
+                        {
+                            vertex.position[0] = -vertex.position[0];
+                            vertex.normal[0] = -vertex.normal[0];
+                        }
+                    }
+                }
+
+                for (std::size_t i = 0; i + 2 < asset.collisionVertices.size(); i += 3)
+                    asset.collisionVertices[i] = -asset.collisionVertices[i];
+                for (std::size_t i = 0; i + 2 < asset.collisionIndices.size(); i += 3)
+                    std::swap(asset.collisionIndices[i + 1], asset.collisionIndices[i + 2]);
+
                 // Fallback: generate collision from visual mesh for assets without
                 // explicit collision data. Uses the preview mesh positions directly.
                 // Skip Grass section - these should never block movement.
@@ -1089,20 +1026,8 @@ namespace phoenix::runtime
                 }
             };
 
-            std::vector<std::thread> workers;
-            workers.reserve(workerCount);
-            for (std::size_t w = 0; w < workerCount; ++w)
-            {
-                workers.emplace_back([&pending, &nextIdx, &buildAsset]() {
-                    for (;;)
-                    {
-                        const auto i = nextIdx.fetch_add(1);
-                        if (i >= pending.size()) break;
-                        buildAsset(i);
-                    }
-                });
-            }
-            for (auto& worker : workers) worker.join();
+            phoenix::app::parallel_for_loading(*mapLoadScheduler_, pending.size(), buildAsset);
+        }
         }
         std::unordered_map<std::string, const LoadedWorldAsset*> assetByName;
         std::unordered_map<std::string, std::int32_t> assetSlotByName;
@@ -1145,11 +1070,13 @@ namespace phoenix::runtime
             {
                 const auto& instance = section.instances[instIdx];
                 SceneObject object{};
-                object.x = instance.position[0] - halfMap;
+                object.x = phoenix::world::source_to_world_x(instance.position[0], halfMap);
                 object.y = instance.position[1];
-                object.z = instance.position[2] - halfMap;
+                object.z = phoenix::world::source_to_world_z(instance.position[2], halfMap);
                 std::copy(std::begin(instance.rotationForward), std::end(instance.rotationForward), std::begin(object.forward));
                 std::copy(std::begin(instance.rotationUp), std::end(instance.rotationUp), std::begin(object.up));
+                phoenix::world::mirror_source_direction_x(object.forward);
+                phoenix::world::mirror_source_direction_x(object.up);
                 object.sectionIndex = static_cast<std::int32_t>(sectionIdx);
                 object.instanceIndex = static_cast<std::int32_t>(instIdx);
 
@@ -1200,11 +1127,13 @@ namespace phoenix::runtime
                     const auto key = phoenix::assets::lower_ascii(buildingSection.assets[static_cast<std::size_t>(bId)]);
 
                     SceneObject object{};
-                    object.x = maniInst.position[0] - halfMap;
+                    object.x = phoenix::world::source_to_world_x(maniInst.position[0], halfMap);
                     object.y = maniInst.position[1];
-                    object.z = maniInst.position[2] - halfMap;
+                    object.z = phoenix::world::source_to_world_z(maniInst.position[2], halfMap);
                     std::copy(std::begin(maniInst.rotationForward), std::end(maniInst.rotationForward), std::begin(object.forward));
                     std::copy(std::begin(maniInst.rotationUp), std::end(maniInst.rotationUp), std::begin(object.up));
+                    phoenix::world::mirror_source_direction_x(object.forward);
+                    phoenix::world::mirror_source_direction_x(object.up);
                     object.sectionIndex = buildingSectionIdx;
                     object.instanceIndex = -1; // not a regular section instance
 
@@ -1220,6 +1149,7 @@ namespace phoenix::runtime
                     if (mani.parsed && mani.enableRotation && std::abs(mani.animationSpeed) >= 0.0001f)
                     {
                         std::copy(std::begin(mani.rotationAxis), std::end(mani.rotationAxis), std::begin(object.maniRotationAxis));
+                        phoenix::world::mirror_source_direction_x(object.maniRotationAxis);
                         object.maniRotationSpeed = mani.animationSpeed * kManiTicksPerSecond;
                     }
 
@@ -1227,7 +1157,291 @@ namespace phoenix::runtime
                 }
             }
         }
+    }
 
+    PhoenixRuntime::WorldAssetPayload PhoenixRuntime::load_world_asset_payload(
+        std::size_t slot,
+        std::uint32_t textureWidth,
+        std::uint32_t textureHeight,
+        std::uint32_t textureMipLevels) const
+    {
+        WorldAssetPayload payload{};
+        payload.slot = slot;
+        if (!uses_world_asset_streaming() || slot >= state_.worldAssets.size())
+            return payload;
+
+        const auto& catalog = state_.worldAssets[slot];
+        payload.asset.name = catalog.name;
+        payload.asset.section = catalog.section;
+        payload.asset.path = catalog.path;
+        if (catalog.path.empty())
+            return payload;
+
+        std::unordered_map<std::string, std::uint32_t> textureOrdinalByPath;
+        const auto textureLayerFor = [&](std::string_view textureName) -> std::uint32_t {
+            if (textureName.empty())
+                return UINT32_MAX;
+            const auto path = phoenix::assets::resolve_texture_asset(
+                state_.assets, std::string(textureName));
+            if (path.empty())
+                return UINT32_MAX;
+            const auto key = phoenix::assets::lower_ascii(path.string());
+            if (const auto it = textureOrdinalByPath.find(key); it != textureOrdinalByPath.end())
+            {
+                const bool cutout = phoenix::renderer::dds_file_has_alpha_cutout(path);
+                return it->second + (cutout ? kAssetCutoutLayerBase : 0u);
+            }
+
+            const auto ordinal = static_cast<std::uint32_t>(payload.texturePaths.size());
+            textureOrdinalByPath.emplace(key, ordinal);
+            payload.texturePaths.push_back(path);
+            auto texture = phoenix::renderer::load_dds(path);
+            if (textureWidth > 0 && textureHeight > 0 && textureMipLevels > 0)
+            {
+                const bool canonical = texture.valid && texture.compressed
+                    && texture.vkFormat == phoenix::renderer::kDdsFormatBc3UnormBlock
+                    && texture.width == textureWidth && texture.height == textureHeight
+                    && texture.mipData.size() >= textureMipLevels;
+                if (!canonical)
+                    phoenix::renderer::convert_texture_to_bc3(
+                        texture, textureWidth, textureHeight, textureMipLevels);
+            }
+            payload.textures.push_back(std::move(texture));
+            const bool cutout = phoenix::renderer::dds_file_has_alpha_cutout(path);
+            return ordinal + (cutout ? kAssetCutoutLayerBase : 0u);
+        };
+
+        const auto extension = phoenix::assets::lower_ascii(catalog.path.extension().string());
+        const bool isVani = extension == ".vani";
+        if (extension == ".smod" || isVani)
+        {
+            auto model = isVani
+                ? phoenix::world::load_vani(catalog.path)
+                : phoenix::world::load_smod(catalog.path);
+            auto& asset = payload.asset;
+            asset.loaded = model.parsed;
+            asset.radius = std::max(8.0f, model.radius);
+            asset.vertexAnimated = model.vertexAnimated;
+            asset.frameCount = std::max(1u, model.frameCount);
+            if (model.hasCollision)
+            {
+                asset.hasCollision = true;
+                asset.collisionVertices = std::move(model.collision.vertices);
+                asset.collisionIndices = std::move(model.collision.indices);
+            }
+
+            for (const auto& mesh : model.meshes)
+            {
+                if (mesh.textureName.empty())
+                    continue;
+                const auto materialHash = color_hash(mesh.textureName);
+                const auto textureLayer = textureLayerFor(mesh.textureName);
+                const auto base = static_cast<std::uint32_t>(asset.previewVertices.size());
+                asset.vertices += static_cast<std::uint32_t>(mesh.vertices.size());
+                asset.previewVertices.reserve(asset.previewVertices.size() + mesh.vertices.size());
+                for (const auto& vertex : mesh.vertices)
+                    append_preview_vertex(asset.previewVertices, vertex.position, vertex.normal,
+                        vertex.uv, materialHash, textureLayer);
+                asset.previewIndices.reserve(asset.previewIndices.size() + mesh.faces.size() * 3u);
+                for (const auto& face : mesh.faces)
+                {
+                    asset.previewIndices.push_back(base + face.indices[0]);
+                    asset.previewIndices.push_back(base + face.indices[1]);
+                    asset.previewIndices.push_back(base + face.indices[2]);
+                }
+
+                if (asset.vertexAnimated && mesh.animationFrames.size() == asset.frameCount)
+                {
+                    if (!asset.animationFrames)
+                        asset.animationFrames = std::make_shared<std::vector<std::vector<phoenix::renderer::TerrainVertex>>>(asset.frameCount);
+                    for (std::uint32_t frame = 0; frame < asset.frameCount; ++frame)
+                    {
+                        auto& frameVertices = (*asset.animationFrames)[frame];
+                        frameVertices.reserve(frameVertices.size() + mesh.animationFrames[frame].size());
+                        for (const auto& vertex : mesh.animationFrames[frame])
+                            append_preview_vertex(frameVertices, vertex.position, vertex.normal,
+                                vertex.uv, materialHash, textureLayer);
+                    }
+                }
+            }
+        }
+        else if (extension == ".dg")
+        {
+            auto model = phoenix::world::load_dg(catalog.path);
+            auto& asset = payload.asset;
+            asset.loaded = model.parsed;
+            asset.radius = std::max({ 12.0f, model.extent[0], model.extent[1], model.extent[2] });
+            if (model.hasCollision)
+            {
+                asset.hasCollision = true;
+                asset.collisionVertices = std::move(model.collision.vertices);
+                asset.collisionIndices = std::move(model.collision.indices);
+            }
+            for (const auto& mesh : model.meshes)
+            {
+                if (mesh.textureName.empty())
+                    continue;
+                const auto materialHash = color_hash(mesh.textureName);
+                const auto textureLayer = textureLayerFor(mesh.textureName);
+                const auto base = static_cast<std::uint32_t>(asset.previewVertices.size());
+                asset.vertices += static_cast<std::uint32_t>(mesh.vertices.size());
+                asset.previewVertices.reserve(asset.previewVertices.size() + mesh.vertices.size());
+                for (const auto& vertex : mesh.vertices)
+                    append_preview_vertex(asset.previewVertices, vertex.position, vertex.normal,
+                        vertex.uv, materialHash, textureLayer);
+                asset.previewIndices.reserve(asset.previewIndices.size() + mesh.indices.size());
+                for (const auto index : mesh.indices)
+                    asset.previewIndices.push_back(base + index);
+            }
+        }
+        else
+        {
+            return payload;
+        }
+
+        auto& asset = payload.asset;
+        for (auto& vertex : asset.previewVertices)
+        {
+            vertex.position[0] = -vertex.position[0];
+            vertex.normal[0] = -vertex.normal[0];
+        }
+        for (std::size_t i = 0; i + 2 < asset.previewIndices.size(); i += 3)
+            std::swap(asset.previewIndices[i + 1], asset.previewIndices[i + 2]);
+        if (asset.animationFrames)
+        {
+            for (auto& frame : *asset.animationFrames)
+                for (auto& vertex : frame)
+                {
+                    vertex.position[0] = -vertex.position[0];
+                    vertex.normal[0] = -vertex.normal[0];
+                }
+        }
+        for (std::size_t i = 0; i + 2 < asset.collisionVertices.size(); i += 3)
+            asset.collisionVertices[i] = -asset.collisionVertices[i];
+        for (std::size_t i = 0; i + 2 < asset.collisionIndices.size(); i += 3)
+            std::swap(asset.collisionIndices[i + 1], asset.collisionIndices[i + 2]);
+
+        if (!asset.hasCollision && asset.loaded && !isVani
+            && !asset.previewVertices.empty() && !asset.previewIndices.empty()
+            && !asset.vertexAnimated && asset.section != "Grass")
+        {
+            asset.collisionVertices.resize(asset.previewVertices.size() * 3u);
+            for (std::size_t i = 0; i < asset.previewVertices.size(); ++i)
+            {
+                asset.collisionVertices[i * 3u + 0u] = asset.previewVertices[i].position[0];
+                asset.collisionVertices[i * 3u + 1u] = asset.previewVertices[i].position[1];
+                asset.collisionVertices[i * 3u + 2u] = asset.previewVertices[i].position[2];
+            }
+            asset.collisionIndices = asset.previewIndices;
+            asset.hasCollision = true;
+        }
+        payload.valid = asset.loaded;
+        return payload;
+    }
+
+    bool PhoenixRuntime::install_world_asset_payload(
+        WorldAssetPayload&& payload,
+        const std::vector<std::uint32_t>& textureLayers)
+    {
+        if (!uses_world_asset_streaming() || !payload.valid
+            || payload.slot >= state_.worldAssets.size())
+            return false;
+
+        auto remapLayer = [&](std::uint32_t layer) {
+            if (layer == UINT32_MAX)
+                return UINT32_MAX;
+            const bool cutout = layer >= kAssetCutoutLayerBase;
+            const auto ordinal = cutout ? layer - kAssetCutoutLayerBase : layer;
+            if (ordinal >= textureLayers.size() || textureLayers[ordinal] == UINT32_MAX)
+                return UINT32_MAX;
+            return textureLayers[ordinal] + (cutout ? kAssetCutoutLayerBase : 0u);
+        };
+        for (auto& vertex : payload.asset.previewVertices)
+            vertex.textureLayer = remapLayer(vertex.textureLayer);
+        if (payload.asset.animationFrames)
+            for (auto& frame : *payload.asset.animationFrames)
+                for (auto& vertex : frame)
+                    vertex.textureLayer = remapLayer(vertex.textureLayer);
+
+        const auto slot = payload.slot;
+        const auto expectedPath = state_.worldAssets[slot].path;
+        if (expectedPath != payload.asset.path)
+            return false;
+        state_.worldAssets[slot] = std::move(payload.asset);
+        for (auto& object : state_.sceneObjects)
+        {
+            if (object.assetSlot == static_cast<std::int32_t>(slot))
+                object.radius = state_.worldAssets[slot].radius;
+        }
+        return true;
+    }
+
+    void PhoenixRuntime::evict_world_asset(std::size_t slot)
+    {
+        if (slot >= state_.worldAssets.size())
+            return;
+        auto catalog = LoadedWorldAsset{};
+        catalog.name = state_.worldAssets[slot].name;
+        catalog.section = state_.worldAssets[slot].section;
+        catalog.path = state_.worldAssets[slot].path;
+        state_.worldAssets[slot] = std::move(catalog);
+        for (auto& object : state_.sceneObjects)
+        {
+            if (object.assetSlot == static_cast<std::int32_t>(slot))
+            {
+                object.loaded = false;
+                object.radius = 18.0f;
+            }
+        }
+    }
+
+    PhoenixRuntime::WorldStreamingDemand PhoenixRuntime::update_world_streaming_demand(
+        float cameraX, float cameraZ, float loadDistance, float unloadDistance)
+    {
+        WorldStreamingDemand demand{};
+        if (!uses_world_asset_streaming())
+            return demand;
+
+        loadDistance = std::max(32.0f, loadDistance);
+        unloadDistance = std::max(loadDistance + 32.0f, unloadDistance);
+        const float loadSq = loadDistance * loadDistance;
+        const float unloadSq = unloadDistance * unloadDistance;
+        std::vector<float> nearest(state_.worldAssets.size(), std::numeric_limits<float>::max());
+        std::vector<bool> insideUnload(state_.worldAssets.size(), false);
+
+        for (auto& object : state_.sceneObjects)
+        {
+            if (object.deleted || object.assetSlot < 0
+                || static_cast<std::size_t>(object.assetSlot) >= state_.worldAssets.size())
+                continue;
+            const auto slot = static_cast<std::size_t>(object.assetSlot);
+            const float dx = object.x - cameraX;
+            const float dz = object.z - cameraZ;
+            const float distanceSq = dx * dx + dz * dz;
+            nearest[slot] = std::min(nearest[slot], distanceSq);
+            if (distanceSq <= unloadSq)
+                insideUnload[slot] = true;
+
+            const bool keepInstance = state_.worldAssets[slot].loaded
+                && (distanceSq <= loadSq || (object.loaded && distanceSq <= unloadSq));
+            if (object.loaded != keepInstance)
+            {
+                object.loaded = keepInstance;
+                demand.instancesChanged = true;
+            }
+        }
+
+        for (std::size_t slot = 0; slot < state_.worldAssets.size(); ++slot)
+        {
+            if (!state_.worldAssets[slot].loaded && nearest[slot] <= loadSq)
+                demand.requests.push_back({ slot, nearest[slot] });
+            else if (state_.worldAssets[slot].loaded && !insideUnload[slot])
+                demand.evictions.push_back(slot);
+        }
+        std::ranges::sort(demand.requests, [](const auto& a, const auto& b) {
+            return a.distanceSquared < b.distanceSquared;
+        });
+        return demand;
     }
 
     PhoenixRuntime::LoadedEffectLibrary PhoenixRuntime::load_effect_library_file(const std::filesystem::path& path) const
@@ -1336,9 +1550,9 @@ namespace phoenix::runtime
                 continue;
 
             EffectPlacement placement{};
-            placement.position[0] = inst.position[0] - halfMap;
+            placement.position[0] = phoenix::world::source_to_world_x(inst.position[0], halfMap);
             placement.position[1] = inst.position[1];
-            placement.position[2] = inst.position[2] - halfMap;
+            placement.position[2] = phoenix::world::source_to_world_z(inst.position[2], halfMap);
 
             float forward[3]{ inst.rotationForward[0], inst.rotationForward[1], inst.rotationForward[2] };
             float up[3]{ inst.rotationUp[0], inst.rotationUp[1], inst.rotationUp[2] };
@@ -1346,11 +1560,18 @@ namespace phoenix::runtime
             const float fallbackUp[3]{ 0.0f, 1.0f, 0.0f };
             normalize(forward, fallbackForward);
             normalize(up, fallbackUp);
-            const float right[3]{
+            float right[3]{
                 up[1] * forward[2] - up[2] * forward[1],
                 up[2] * forward[0] - up[0] * forward[2],
                 up[0] * forward[1] - up[1] * forward[0],
             };
+            // Effect geometry remains in its authored local space, unlike
+            // SMOD/DG geometry.  Reflect every source basis column directly;
+            // recomputing right after reflection would introduce the extra
+            // determinant sign of a cross product and flip the effect again.
+            phoenix::world::mirror_source_direction_x(forward);
+            phoenix::world::mirror_source_direction_x(up);
+            phoenix::world::mirror_source_direction_x(right);
             std::copy(std::begin(forward), std::end(forward), std::begin(placement.forward));
             std::copy(std::begin(up), std::end(up), std::begin(placement.up));
             std::copy(std::begin(right), std::end(right), std::begin(placement.right));
@@ -1366,9 +1587,8 @@ namespace phoenix::runtime
             return 0.0f;
 
         const auto mapSize = static_cast<float>(std::max(1u, state_.world.mapSize));
-        const auto halfMap = mapSize * 0.5f;
-        const auto u = std::clamp((worldX + halfMap) / mapSize, 0.0f, 1.0f);
-        const auto v = std::clamp((worldZ + halfMap) / mapSize, 0.0f, 1.0f);
+        const auto u = phoenix::world::world_to_source_u(worldX, mapSize);
+        const auto v = phoenix::world::world_to_source_v(worldZ, mapSize);
         const auto side = state_.world.heightMapSide;
         const auto fx = u * static_cast<float>(side - 1);
         const auto fz = v * static_cast<float>(side - 1);
@@ -1393,9 +1613,8 @@ namespace phoenix::runtime
             return {};
 
         const auto mapSize = static_cast<float>(std::max(1u, w.mapSize));
-        const auto halfMap = mapSize * 0.5f;
-        const auto u = std::clamp((worldX + halfMap) / mapSize, 0.0f, 1.0f);
-        const auto v = std::clamp((worldZ + halfMap) / mapSize, 0.0f, 1.0f);
+        const auto u = phoenix::world::world_to_source_u(worldX, mapSize);
+        const auto v = phoenix::world::world_to_source_v(worldZ, mapSize);
         const auto side = w.heightMapSide;
         const auto ix = std::min(static_cast<std::uint32_t>(u * static_cast<float>(side - 1)), side - 1);
         const auto iz = std::min(static_cast<std::uint32_t>(v * static_cast<float>(side - 1)), side - 1);
@@ -1671,7 +1890,7 @@ namespace phoenix::runtime
         return paths;
     }
 
-    std::vector<std::filesystem::path> PhoenixRuntime::asset_texture_paths() const
+    const std::vector<std::filesystem::path>& PhoenixRuntime::asset_texture_paths() const
     {
         return state_.assetTexturePaths;
     }
@@ -1908,6 +2127,172 @@ namespace phoenix::runtime
         return state_.assets.resolve("skybox_SR.dds");
     }
 
+    void PhoenixRuntime::append_terrain_lod_transitions(
+        std::vector<phoenix::renderer::TerrainVertex>& vertices,
+        std::vector<std::uint32_t>& indices,
+        TerrainLodInfo& lodInfo) const
+    {
+        if (lodInfo.chunks.empty() || lodInfo.chunkCountX == 0
+            || lodInfo.chunkCountZ == 0 || lodInfo.grid == 0)
+            return;
+
+        const std::uint32_t strides[kTerrainLodLevels]{ 1u, 2u, 4u, 8u };
+        const auto makeVertex = [&](std::uint32_t gx, std::uint32_t gz, float height) {
+            const float wx = -lodInfo.halfMap + static_cast<float>(gx) * lodInfo.cellSize;
+            const float wz = -lodInfo.halfMap + static_cast<float>(gz) * lodInfo.cellSize;
+            float nx = terrain_height(wx - lodInfo.cellSize, wz)
+                - terrain_height(wx + lodInfo.cellSize, wz);
+            float ny = 2.0f * lodInfo.cellSize;
+            float nz = terrain_height(wx, wz - lodInfo.cellSize)
+                - terrain_height(wx, wz + lodInfo.cellSize);
+            const float normalLength = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (normalLength > 0.001f)
+            {
+                nx /= normalLength; ny /= normalLength; nz /= normalLength;
+            }
+
+            const auto high = std::clamp((height + 24.0f) / 150.0f, 0.0f, 1.0f);
+            const bool water = height < 1.5f;
+            phoenix::renderer::TerrainVertex vertex{};
+            vertex.position[0] = wx;
+            vertex.position[1] = height;
+            vertex.position[2] = wz;
+            vertex.color[0] = water ? 0.03f : 0.20f + high * 0.26f;
+            vertex.color[1] = water ? 0.14f + high * 0.06f : 0.42f + high * 0.22f;
+            vertex.color[2] = water ? 0.32f + high * 0.10f : 0.18f + high * 0.12f;
+            vertex.normal[0] = nx;
+            vertex.normal[1] = ny;
+            vertex.normal[2] = nz;
+            vertex.uv[0] = (wx + lodInfo.halfMap) / 8.0f;
+            vertex.uv[1] = (wz + lodInfo.halfMap) / 8.0f;
+            vertex.textureLayer = !state_.world.terrainLayers.empty()
+                && !state_.world.terrainTextureMap.empty() ? 0xFFFFFFFDu : 0xFFFFFFFFu;
+            return vertex;
+        };
+
+        lodInfo.transitions.clear();
+        lodInfo.transitions.reserve(
+            static_cast<std::size_t>(lodInfo.chunkCountX - 1u) * lodInfo.chunkCountZ
+            + static_cast<std::size_t>(lodInfo.chunkCountZ - 1u) * lodInfo.chunkCountX);
+
+        const auto appendTransition = [&](std::uint32_t chunkA, std::uint32_t chunkB,
+            bool varyingX, std::uint32_t boundary, std::uint32_t varyingBegin,
+            std::uint32_t varyingEnd) {
+            if (lodInfo.chunks[chunkA][0].indexCount == 0
+                || lodInfo.chunks[chunkB][0].indexCount == 0)
+                return;
+
+            TerrainLodTransition transition{};
+            transition.chunkA = chunkA;
+            transition.chunkB = chunkB;
+            bool hasBridge = false;
+
+            // Geometry depends on the two resolutions, not on which side owns
+            // the denser mesh, so each unordered pair is generated only once.
+            for (std::size_t fineLod = 0; fineLod < kTerrainLodLevels; ++fineLod)
+            {
+                for (std::size_t coarseLod = fineLod + 1;
+                    coarseLod < kTerrainLodLevels; ++coarseLod)
+                {
+                    const auto fineStride = strides[fineLod];
+                    const auto coarseStride = strides[coarseLod];
+                    const auto firstVertex = static_cast<std::uint32_t>(vertices.size());
+                    float maximumGap = 0.0f;
+                    std::uint32_t pointCount = 0;
+
+                    for (std::uint32_t varying = varyingBegin;;)
+                    {
+                        const auto gx = varyingX ? varying : boundary;
+                        const auto gz = varyingX ? boundary : varying;
+                        const float wx = -lodInfo.halfMap
+                            + static_cast<float>(gx) * lodInfo.cellSize;
+                        const float wz = -lodInfo.halfMap
+                            + static_cast<float>(gz) * lodInfo.cellSize;
+                        const float denseHeight = terrain_height(wx, wz);
+
+                        const auto relative = varying - varyingBegin;
+                        const auto coarseBegin = varyingBegin
+                            + (relative / coarseStride) * coarseStride;
+                        const auto coarseEnd = std::min(varyingEnd,
+                            coarseBegin + coarseStride);
+                        const auto coarseGx0 = varyingX ? coarseBegin : boundary;
+                        const auto coarseGz0 = varyingX ? boundary : coarseBegin;
+                        const auto coarseGx1 = varyingX ? coarseEnd : boundary;
+                        const auto coarseGz1 = varyingX ? boundary : coarseEnd;
+                        const float coarseWx0 = -lodInfo.halfMap
+                            + static_cast<float>(coarseGx0) * lodInfo.cellSize;
+                        const float coarseWz0 = -lodInfo.halfMap
+                            + static_cast<float>(coarseGz0) * lodInfo.cellSize;
+                        const float coarseWx1 = -lodInfo.halfMap
+                            + static_cast<float>(coarseGx1) * lodInfo.cellSize;
+                        const float coarseWz1 = -lodInfo.halfMap
+                            + static_cast<float>(coarseGz1) * lodInfo.cellSize;
+                        const float coarseHeight0 = terrain_height(coarseWx0, coarseWz0);
+                        const float coarseHeight1 = terrain_height(coarseWx1, coarseWz1);
+                        const float weight = coarseEnd == coarseBegin ? 0.0f
+                            : static_cast<float>(varying - coarseBegin)
+                                / static_cast<float>(coarseEnd - coarseBegin);
+                        const float coarseHeight = coarseHeight0
+                            + (coarseHeight1 - coarseHeight0) * weight;
+
+                        vertices.push_back(makeVertex(gx, gz, denseHeight));
+                        vertices.push_back(makeVertex(gx, gz, coarseHeight));
+                        maximumGap = std::max(maximumGap,
+                            std::abs(denseHeight - coarseHeight));
+                        ++pointCount;
+                        if (varying == varyingEnd)
+                            break;
+                        varying = std::min(varyingEnd, varying + fineStride);
+                    }
+
+                    if (pointCount < 2 || maximumGap < 0.001f)
+                    {
+                        vertices.resize(firstVertex);
+                        continue;
+                    }
+
+                    TerrainChunkLod range{};
+                    range.firstIndex = static_cast<std::uint32_t>(indices.size());
+                    for (std::uint32_t point = 0; point + 1u < pointCount; ++point)
+                    {
+                        const auto base = firstVertex + point * 2u;
+                        indices.insert(indices.end(), {
+                            base, base + 2u, base + 1u,
+                            base + 2u, base + 3u, base + 1u,
+                        });
+                    }
+                    range.indexCount = static_cast<std::uint32_t>(indices.size())
+                        - range.firstIndex;
+                    transition.ranges[fineLod][coarseLod] = range;
+                    transition.ranges[coarseLod][fineLod] = range;
+                    hasBridge = true;
+                }
+            }
+
+            if (hasBridge)
+                lodInfo.transitions.push_back(std::move(transition));
+        };
+
+        constexpr std::uint32_t kChunkQ = kTerrainChunkQuads;
+        for (std::uint32_t cz = 0; cz < lodInfo.chunkCountZ; ++cz)
+        {
+            for (std::uint32_t cx = 0; cx < lodInfo.chunkCountX; ++cx)
+            {
+                const auto chunkA = cz * lodInfo.chunkCountX + cx;
+                const auto qMinX = cx * kChunkQ;
+                const auto qMinZ = cz * kChunkQ;
+                const auto qMaxX = std::min(lodInfo.grid, qMinX + kChunkQ);
+                const auto qMaxZ = std::min(lodInfo.grid, qMinZ + kChunkQ);
+                if (cx + 1u < lodInfo.chunkCountX)
+                    appendTransition(chunkA, chunkA + 1u, false,
+                        qMaxX, qMinZ, qMaxZ);
+                if (cz + 1u < lodInfo.chunkCountZ)
+                    appendTransition(chunkA, chunkA + lodInfo.chunkCountX, true,
+                        qMaxZ, qMinX, qMaxX);
+            }
+        }
+    }
+
     void PhoenixRuntime::build_terrain_mesh(
         std::vector<phoenix::renderer::TerrainVertex>& vertices,
         std::vector<std::uint32_t>& indices,
@@ -2019,7 +2404,7 @@ namespace phoenix::runtime
                     const auto qMaxX = std::min(grid, qMinX + kChunkQ);
                     const auto qMaxZ = std::min(grid, qMinZ + kChunkQ);
 
-                    for (int lod = 0; lod < kTerrainLodLevels; ++lod)
+                    for (std::size_t lod = 0; lod < kTerrainLodLevels; ++lod)
                     {
                         const auto stride = strides[lod];
                         const auto firstIdx = static_cast<std::uint32_t>(indices.size());
@@ -2049,146 +2434,126 @@ namespace phoenix::runtime
             }
         }
 
+        append_terrain_lod_transitions(vertices, indices, lodInfo);
+    }
+
+    void PhoenixRuntime::build_streamed_terrain_mesh(
+        std::vector<phoenix::renderer::TerrainVertex>& vertices,
+        std::vector<std::uint32_t>& indices,
+        TerrainLodInfo& lodInfo,
+        float centerX, float centerZ, float residentDistance) const
+    {
+        vertices.clear();
+        indices.clear();
+        lodInfo = {};
+        if (!state_.world.parsed || state_.world.heightSamples.empty()
+            || state_.world.heightMapSide < 2)
+            return;
+
+        const auto mapSize = static_cast<float>(std::max(1u, state_.world.mapSize));
+        const auto halfMap = mapSize * 0.5f;
+        const auto side = state_.world.heightMapSide;
+        const auto grid = side - 1u;
+        const auto stepWorld = mapSize / static_cast<float>(grid);
+        const auto texLayer = !state_.world.terrainLayers.empty()
+            && !state_.world.terrainTextureMap.empty() ? 0xFFFFFFFDu : 0xFFFFFFFFu;
+
+        constexpr std::uint32_t kChunkQ = kTerrainChunkQuads;
+        const auto chunkCountX = (grid + kChunkQ - 1u) / kChunkQ;
+        const auto chunkCountZ = chunkCountX;
+        lodInfo.chunkCountX = chunkCountX;
+        lodInfo.chunkCountZ = chunkCountZ;
+        lodInfo.grid = grid;
+        lodInfo.cellSize = stepWorld;
+        lodInfo.halfMap = halfMap;
+        lodInfo.chunks.resize(static_cast<std::size_t>(chunkCountX) * chunkCountZ);
+
+        const std::uint32_t strides[kTerrainLodLevels] = { 1u, 2u, 4u, 8u };
+        for (std::uint32_t cz = 0; cz < chunkCountZ; ++cz)
         {
-        }
-        return;
+            for (std::uint32_t cx = 0; cx < chunkCountX; ++cx)
+            {
+                const auto qMinX = cx * kChunkQ;
+                const auto qMinZ = cz * kChunkQ;
+                const auto qMaxX = std::min(grid, qMinX + kChunkQ);
+                const auto qMaxZ = std::min(grid, qMinZ + kChunkQ);
+                const float chunkCenterX = -halfMap
+                    + static_cast<float>(qMinX + qMaxX) * 0.5f * stepWorld;
+                const float chunkCenterZ = -halfMap
+                    + static_cast<float>(qMinZ + qMaxZ) * 0.5f * stepWorld;
+                const float chunkRadius = std::sqrt(
+                    std::pow(static_cast<float>(qMaxX - qMinX) * stepWorld * 0.5f, 2.0f)
+                    + std::pow(static_cast<float>(qMaxZ - qMinZ) * stepWorld * 0.5f, 2.0f));
+                const float dx = chunkCenterX - centerX;
+                const float dz = chunkCenterZ - centerZ;
+                const float reach = residentDistance + chunkRadius;
+                if (dx * dx + dz * dz > reach * reach)
+                    continue;
 
-        std::vector<std::size_t> objectOrder(state_.sceneObjects.size());
-        std::iota(objectOrder.begin(), objectOrder.end(), std::size_t{});
-        std::ranges::sort(objectOrder, [this](const auto lhs, const auto rhs) {
-            const auto& a = state_.sceneObjects[lhs];
-            const auto& b = state_.sceneObjects[rhs];
-            if (a.loaded != b.loaded)
-                return a.loaded > b.loaded;
-            return a.radius > b.radius;
-        });
-        std::vector<std::uint8_t> meshRendered(state_.sceneObjects.size());
-        std::uint32_t highObjectCount{};
-
-        const auto appendTransformedMesh = [this, &vertices, &indices](
-            const SceneObject& object,
-            const std::vector<phoenix::renderer::TerrainVertex>& sourceVertices,
-            const std::vector<std::uint32_t>& sourceIndices) {
-            if (sourceVertices.empty() || sourceIndices.empty())
-                return false;
-
-            const auto base = static_cast<std::uint32_t>(vertices.size());
-            float forward[3]{ object.forward[0], object.forward[1], object.forward[2] };
-            float up[3]{ object.up[0], object.up[1], object.up[2] };
-            auto normalize = [](float* vector, const float* fallback) {
-                const auto length = std::sqrt(vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
-                if (length < 0.001f)
+                const auto localSideX = qMaxX - qMinX + 1u;
+                const auto localSideZ = qMaxZ - qMinZ + 1u;
+                const auto baseVertex = static_cast<std::uint32_t>(vertices.size());
+                vertices.reserve(vertices.size()
+                    + static_cast<std::size_t>(localSideX) * localSideZ);
+                for (std::uint32_t z = qMinZ; z <= qMaxZ; ++z)
                 {
-                    vector[0] = fallback[0];
-                    vector[1] = fallback[1];
-                    vector[2] = fallback[2];
-                    return;
+                    const float wz = -halfMap + static_cast<float>(z) * stepWorld;
+                    for (std::uint32_t x = qMinX; x <= qMaxX; ++x)
+                    {
+                        const float wx = -halfMap + static_cast<float>(x) * stepWorld;
+                        const float h = terrain_height(wx, wz);
+                        float nx = terrain_height(wx - stepWorld, wz)
+                            - terrain_height(wx + stepWorld, wz);
+                        float ny = 2.0f * stepWorld;
+                        float nz = terrain_height(wx, wz - stepWorld)
+                            - terrain_height(wx, wz + stepWorld);
+                        const float normalLength = std::sqrt(nx * nx + ny * ny + nz * nz);
+                        if (normalLength > 0.001f)
+                        {
+                            nx /= normalLength; ny /= normalLength; nz /= normalLength;
+                        }
+                        const auto high = std::clamp((h + 24.0f) / 150.0f, 0.0f, 1.0f);
+                        const bool water = h < 1.5f;
+                        phoenix::renderer::TerrainVertex vertex{};
+                        vertex.position[0] = wx; vertex.position[1] = h; vertex.position[2] = wz;
+                        vertex.color[0] = water ? 0.03f : 0.20f + high * 0.26f;
+                        vertex.color[1] = water ? 0.14f + high * 0.06f : 0.42f + high * 0.22f;
+                        vertex.color[2] = water ? 0.32f + high * 0.10f : 0.18f + high * 0.12f;
+                        vertex.normal[0] = nx; vertex.normal[1] = ny; vertex.normal[2] = nz;
+                        vertex.uv[0] = (wx + halfMap) / 8.0f;
+                        vertex.uv[1] = (wz + halfMap) / 8.0f;
+                        vertex.textureLayer = texLayer;
+                        vertices.push_back(vertex);
+                    }
                 }
-                vector[0] /= length;
-                vector[1] /= length;
-                vector[2] /= length;
-            };
-            const float fallbackForward[3]{ 0.0f, 0.0f, 1.0f };
-            const float fallbackUp[3]{ 0.0f, 1.0f, 0.0f };
-            normalize(forward, fallbackForward);
-            normalize(up, fallbackUp);
-            const float right[3]{
-                up[1] * forward[2] - up[2] * forward[1],
-                up[2] * forward[0] - up[0] * forward[2],
-                up[0] * forward[1] - up[1] * forward[0],
-            };
 
-            const auto requiredVertices = vertices.size() + sourceVertices.size();
-            if (vertices.capacity() < requiredVertices)
-                vertices.reserve(std::max(requiredVertices, vertices.capacity() * 2u));
-            for (const auto& source : sourceVertices)
-            {
-                phoenix::renderer::TerrainVertex vertex = source;
-                const auto lx = source.position[0];
-                const auto ly = source.position[1];
-                const auto lz = source.position[2];
-                vertex.position[0] = object.x + right[0] * lx + up[0] * ly + forward[0] * lz;
-                vertex.position[1] = object.y + right[1] * lx + up[1] * ly + forward[1] * lz;
-                vertex.position[2] = object.z + right[2] * lx + up[2] * ly + forward[2] * lz;
-                vertices.push_back(vertex);
-            }
-
-            const auto requiredIndices = indices.size() + sourceIndices.size();
-            if (indices.capacity() < requiredIndices)
-                indices.reserve(std::max(requiredIndices, indices.capacity() * 2u));
-            for (const auto index : sourceIndices)
-                indices.push_back(base + index);
-            return true;
-        };
-
-        for (const auto objectIndex : objectOrder)
-        {
-            const auto& object = state_.sceneObjects[objectIndex];
-            constexpr std::size_t kMaxHighObjectVertices = 5500000;
-            const auto useMesh = object.assetSlot >= 0
-                && static_cast<std::size_t>(object.assetSlot) < state_.worldAssets.size()
-                && !state_.worldAssets[static_cast<std::size_t>(object.assetSlot)].previewVertices.empty()
-                && !state_.worldAssets[static_cast<std::size_t>(object.assetSlot)].previewIndices.empty()
-                && vertices.size() + state_.worldAssets[static_cast<std::size_t>(object.assetSlot)].previewVertices.size() < kMaxHighObjectVertices;
-
-            if (useMesh)
-            {
-                const auto& asset = state_.worldAssets[static_cast<std::size_t>(object.assetSlot)];
-                appendTransformedMesh(object, asset.previewVertices, asset.previewIndices);
-                meshRendered[objectIndex] = 1;
-                ++highObjectCount;
-                continue;
+                const auto chunkIndex = static_cast<std::size_t>(cz) * chunkCountX + cx;
+                for (std::size_t lod = 0; lod < kTerrainLodLevels; ++lod)
+                {
+                    const auto stride = strides[lod];
+                    auto& range = lodInfo.chunks[chunkIndex][lod];
+                    range.firstIndex = static_cast<std::uint32_t>(indices.size());
+                    for (std::uint32_t z = qMinZ; z < qMaxZ; z += stride)
+                    {
+                        const auto zNext = std::min(z + stride, qMaxZ);
+                        for (std::uint32_t x = qMinX; x < qMaxX; x += stride)
+                        {
+                            const auto xNext = std::min(x + stride, qMaxX);
+                            const auto local = [&](std::uint32_t vx, std::uint32_t vz) {
+                                return baseVertex + (vz - qMinZ) * localSideX + (vx - qMinX);
+                            };
+                            const auto a = local(x, z);
+                            const auto b = local(xNext, z);
+                            const auto c = local(x, zNext);
+                            const auto d = local(xNext, zNext);
+                            indices.insert(indices.end(), { a, c, b, b, c, d });
+                        }
+                    }
+                    range.indexCount = static_cast<std::uint32_t>(indices.size()) - range.firstIndex;
+                }
             }
         }
-
-        std::uint32_t loadedPlaceholders{};
-        std::uint32_t missingPlaceholders{};
-        for (std::size_t objectIndex = 0; objectIndex < state_.sceneObjects.size(); ++objectIndex)
-        {
-            if (meshRendered[objectIndex])
-                continue;
-            const auto& object = state_.sceneObjects[objectIndex];
-            if (object.loaded)
-                ++loadedPlaceholders;
-            else
-                ++missingPlaceholders;
-            const auto h = object.y + 1.5f;
-            const auto size = std::clamp(object.radius * 0.08f, 1.8f, 7.0f);
-            const auto base = static_cast<std::uint32_t>(vertices.size());
-            const float color[3] = {
-                object.loaded ? 0.96f : 0.85f,
-                object.loaded ? 0.68f : 0.20f,
-                object.loaded ? 0.18f : 0.18f,
-            };
-            const float points[4][3] = {
-                { object.x, h, object.z - size },
-                { object.x + size, h, object.z },
-                { object.x, h, object.z + size },
-                { object.x - size, h, object.z },
-            };
-            for (const auto& point : points)
-            {
-                phoenix::renderer::TerrainVertex vertex{};
-                vertex.position[0] = point[0];
-                vertex.position[1] = point[1];
-                vertex.position[2] = point[2];
-                vertex.color[0] = color[0];
-                vertex.color[1] = color[1];
-                vertex.color[2] = color[2];
-                vertex.normal[0] = 0.0f;
-                vertex.normal[1] = 1.0f;
-                vertex.normal[2] = 0.0f;
-                vertex.textureLayer = 0xFFFFFFFFu;
-                vertices.push_back(vertex);
-            }
-            indices.push_back(base + 0);
-            indices.push_back(base + 1);
-            indices.push_back(base + 2);
-            indices.push_back(base + 0);
-            indices.push_back(base + 2);
-            indices.push_back(base + 3);
-        }
-
+        append_terrain_lod_transitions(vertices, indices, lodInfo);
     }
 
     StaticObjectScene PhoenixRuntime::build_static_object_scene() const
@@ -2197,7 +2562,11 @@ namespace phoenix::runtime
         if (state_.worldAssets.empty() || state_.sceneObjects.empty())
             return scene;
 
-        constexpr float kCellSize = 512.0f;
+        // Compatibility's object LOD gains most of its value by rejecting small
+        // spatial groups before drawing.  Keep the original meshes intact, but
+        // split each asset's instances into compact cells so frustum/indirect
+        // culling can discard distant or off-screen decor as a unit.
+        constexpr float kCellSize = 128.0f;
         struct CellGroup
         {
             std::int32_t cellX{};
@@ -2253,7 +2622,7 @@ namespace phoenix::runtime
             const auto& asset = state_.worldAssets[assetSlot];
             vertexCount += asset.previewVertices.size();
             indexCount += asset.previewIndices.size();
-            ++batchCount; // one merged batch per unique asset
+            batchCount += groupsByAsset[assetSlot].size();
             for (const auto& group : groupsByAsset[assetSlot])
                 instanceCount += group.objectIndices.size();
         }
@@ -2264,10 +2633,10 @@ namespace phoenix::runtime
         scene.batches.reserve(batchCount);
         scene.batchBounds.reserve(batchCount);
 
-        float currentCullDistance = 0.0f; // 0 = no cull, >0 = max render distance (VANI)
-
         const auto appendInstance = [&](const SceneObject& object) {
-            scene.instances.push_back(make_object_instance(object, currentCullDistance));
+            // Zero means there is no per-asset cap: the universal fog/view
+            // distance is the single render boundary for every world asset.
+            scene.instances.push_back(make_object_instance(object, 0.0f));
         };
 
         for (std::size_t assetSlot = 0; assetSlot < state_.worldAssets.size(); ++assetSlot)
@@ -2283,34 +2652,24 @@ namespace phoenix::runtime
 
             const auto& asset = state_.worldAssets[assetSlot];
 
-            // VANI assets get an extra fixed 200m render cutoff on top of the
-            // universal fog/view distance culling every other asset already
-            // gets (the vertex shader clamps this to whichever is smaller).
-            const auto assetKey = phoenix::assets::lower_ascii(asset.name);
-            currentCullDistance = assetKey.ends_with(".vani") ? kVaniRenderDistance : 0.0f;
-
             const auto baseVertex = static_cast<std::uint32_t>(scene.vertices.size());
             const auto firstIndex = static_cast<std::uint32_t>(scene.indices.size());
             scene.vertices.insert(scene.vertices.end(), asset.previewVertices.begin(), asset.previewVertices.end());
             for (const auto index : asset.previewIndices)
                 scene.indices.push_back(baseVertex + index);
 
-            // Merge all spatial groups of this asset into ONE batch.
-            // Instances are contiguous per asset, so a single draw call
-            // covers all instances — trading per-cell frustum culling for
-            // dramatically fewer draw calls (GPU clips off-screen instances
-            // after vertex shading, which is cheap).
-            const auto firstInstance = static_cast<std::uint32_t>(scene.instances.size());
-
-            float minX = std::numeric_limits<float>::max();
-            float minY = std::numeric_limits<float>::max();
-            float minZ = std::numeric_limits<float>::max();
-            float maxX = -std::numeric_limits<float>::max();
-            float maxY = -std::numeric_limits<float>::max();
-            float maxZ = -std::numeric_limits<float>::max();
-
+            // One batch per compact spatial cell. The indirect path consumes all
+            // of these in one GPU submission; the fallback path only emits the
+            // cells that pass the same bounds test.
             for (const auto& group : groups)
             {
+                const auto firstInstance = static_cast<std::uint32_t>(scene.instances.size());
+                float minX = std::numeric_limits<float>::max();
+                float minY = std::numeric_limits<float>::max();
+                float minZ = std::numeric_limits<float>::max();
+                float maxX = -std::numeric_limits<float>::max();
+                float maxY = -std::numeric_limits<float>::max();
+                float maxZ = -std::numeric_limits<float>::max();
                 for (const auto objectIndex : group.objectIndices)
                 {
                     const auto& object = state_.sceneObjects[objectIndex];
@@ -2323,27 +2682,24 @@ namespace phoenix::runtime
                     maxY = std::max(maxY, object.y + radius);
                     maxZ = std::max(maxZ, object.z + radius);
                 }
+
+                StaticObjectScene::BatchBounds bounds{};
+                bounds.x = (minX + maxX) * 0.5f;
+                bounds.y = (minY + maxY) * 0.5f;
+                bounds.z = (minZ + maxZ) * 0.5f;
+                const auto extentX = (maxX - minX) * 0.5f;
+                const auto extentY = (maxY - minY) * 0.5f;
+                const auto extentZ = (maxZ - minZ) * 0.5f;
+                bounds.radius = std::sqrt(extentX * extentX + extentY * extentY + extentZ * extentZ);
+
+                phoenix::renderer::ObjectBatch batch{};
+                batch.firstIndex = firstIndex;
+                batch.indexCount = static_cast<std::uint32_t>(asset.previewIndices.size());
+                batch.firstInstance = firstInstance;
+                batch.instanceCount = static_cast<std::uint32_t>(scene.instances.size()) - firstInstance;
+                scene.batches.push_back(batch);
+                scene.batchBounds.push_back(bounds);
             }
-
-            const auto totalInstances = static_cast<std::uint32_t>(scene.instances.size()) - firstInstance;
-
-            StaticObjectScene::BatchBounds bounds{};
-            bounds.x = (minX + maxX) * 0.5f;
-            bounds.y = (minY + maxY) * 0.5f;
-            bounds.z = (minZ + maxZ) * 0.5f;
-            const auto extentX = (maxX - minX) * 0.5f;
-            const auto extentY = (maxY - minY) * 0.5f;
-            const auto extentZ = (maxZ - minZ) * 0.5f;
-            bounds.radius = std::sqrt(extentX * extentX + extentY * extentY + extentZ * extentZ);
-
-            phoenix::renderer::ObjectBatch batch{};
-            batch.firstIndex = firstIndex;
-            batch.indexCount = static_cast<std::uint32_t>(asset.previewIndices.size());
-            batch.firstInstance = firstInstance;
-            batch.instanceCount = totalInstances;
-            scene.batches.push_back(batch);
-
-            scene.batchBounds.push_back(bounds);
         }
 
         return scene;
@@ -2371,10 +2727,8 @@ namespace phoenix::runtime
                 groupsByAsset[assetSlot].push_back(objectIndex);
         }
 
-        float animCullDistance = 0.0f;
-
         const auto appendInstance = [&](const SceneObject& object) {
-            const auto instance = make_object_instance(object, animCullDistance);
+            const auto instance = make_object_instance(object, 0.0f);
             scene.baseInstances.push_back(instance);
             scene.instances.push_back(instance);
         };
@@ -2386,11 +2740,6 @@ namespace phoenix::runtime
                 continue;
 
             const auto& asset = state_.worldAssets[assetSlot];
-            const auto animKey = phoenix::assets::lower_ascii(asset.name);
-            // VANI assets get an extra fixed 200m render cutoff on top of the
-            // universal fog/view distance culling every other asset already
-            // gets (the vertex shader clamps this to whichever is smaller).
-            animCullDistance = animKey.ends_with(".vani") ? kVaniRenderDistance : 0.0f;
             const auto baseVertex = static_cast<std::uint32_t>(scene.vertices.size());
             const auto firstIndex = static_cast<std::uint32_t>(scene.indices.size());
             scene.vertices.insert(scene.vertices.end(), asset.previewVertices.begin(), asset.previewVertices.end());
@@ -2454,13 +2803,10 @@ namespace phoenix::runtime
     }
 
     void PhoenixRuntime::update_animated_object_scene(AnimatedObjectScene& scene, float totalTime,
-        float cameraX, float cameraY, float cameraZ) const
+        float cameraX, float cameraY, float cameraZ, float viewDistance) const
     {
         constexpr float kDecorFps = 12.0f;
-        // Matches kVaniRenderDistance: beyond the render cutoff a VANI instance
-        // isn't drawn at all, so skip the CPU frame update too (no freeze —
-        // it simply isn't on screen past this distance).
-        constexpr float kAnimateDistanceSq = kVaniRenderDistance * kVaniRenderDistance;
+        const float animateDistanceSq = viewDistance * viewDistance;
 
         for (auto& animation : scene.vertexAnimations)
         {
@@ -2478,7 +2824,7 @@ namespace phoenix::runtime
                 const float dx = position[0] - cameraX;
                 const float dy = position[1] - cameraY;
                 const float dz = position[2] - cameraZ;
-                if (dx * dx + dy * dy + dz * dz <= kAnimateDistanceSq)
+                if (dx * dx + dy * dy + dz * dz <= animateDistanceSq)
                 {
                     anyInstanceNear = true;
                     break;
@@ -2524,41 +2870,44 @@ namespace phoenix::runtime
     {
         if (input.look)
         {
-            camera_.yaw += input.mouseDx * 0.0032f;
-            camera_.pitch = std::clamp(camera_.pitch + input.mouseDy * 0.0032f, -1.25f, 0.45f);
+            camera_.yaw -= input.mouseDx * 0.003f;
+            camera_.pitch = std::clamp(camera_.pitch - input.mouseDy * 0.003f, -1.5f, 1.5f);
         }
         if (input.yawLeft)
             camera_.yaw -= deltaSeconds * 1.8f;
         if (input.yawRight)
             camera_.yaw += deltaSeconds * 1.8f;
         if (input.pitchUp)
-            camera_.pitch = std::clamp(camera_.pitch - deltaSeconds * 1.4f, -1.25f, 0.45f);
+            camera_.pitch = std::clamp(camera_.pitch - deltaSeconds * 1.4f, -1.5f, 1.5f);
         if (input.pitchDown)
-            camera_.pitch = std::clamp(camera_.pitch + deltaSeconds * 1.4f, -1.25f, 0.45f);
+            camera_.pitch = std::clamp(camera_.pitch + deltaSeconds * 1.4f, -1.5f, 1.5f);
 
-        const auto dungeonMode = state_.world.isDungeon;
-        const auto minSpeed = dungeonMode ? 15.0f : 80.0f;
-        const auto maxSpeed = dungeonMode ? 300.0f : 1400.0f;
-        camera_.speed = std::clamp(camera_.speed + input.wheel * 0.10f, minSpeed, maxSpeed);
-        const auto speed = camera_.speed * (input.fast ? 3.2f : 1.0f) * std::max(0.0f, deltaSeconds);
+        if (input.wheel != 0.0f)
+            camera_.speed = std::clamp(camera_.speed * std::pow(1.2f, input.wheel), 2.0f, 2000.0f);
+        const auto speed = camera_.speed * (input.fast ? 6.0f : 1.0f) * std::max(0.0f, deltaSeconds);
         const auto cy = std::cos(camera_.yaw);
         const auto sy = std::sin(camera_.yaw);
+        const auto cp = std::cos(camera_.pitch);
+        const auto sp = std::sin(camera_.pitch);
         const auto forwardX = sy;
-        const auto forwardZ = cy;
-        const auto rightX = cy;
-        const auto rightZ = -sy;
+        const auto forwardY = sp;
+        const auto forwardZ = cp * cy;
+        const auto rightX = -cy;
+        const auto rightZ = sy;
 
         float moveX = 0.0f;
         float moveY = 0.0f;
         float moveZ = 0.0f;
         if (input.forward)
         {
-            moveX += forwardX;
+            moveX += cp * forwardX;
+            moveY += forwardY;
             moveZ += forwardZ;
         }
         if (input.backward)
         {
-            moveX -= forwardX;
+            moveX -= cp * forwardX;
+            moveY -= forwardY;
             moveZ -= forwardZ;
         }
         if (input.right)
@@ -2576,11 +2925,12 @@ namespace phoenix::runtime
         if (input.down)
             moveY -= 1.0f;
 
-        const auto horizontalLength = std::sqrt(moveX * moveX + moveZ * moveZ);
-        if (horizontalLength > 0.001f)
+        const auto moveLength = std::sqrt(moveX * moveX + moveY * moveY + moveZ * moveZ);
+        if (moveLength > 0.001f)
         {
-            moveX /= horizontalLength;
-            moveZ /= horizontalLength;
+            moveX /= moveLength;
+            moveY /= moveLength;
+            moveZ /= moveLength;
         }
         camera_.x += moveX * speed;
         camera_.y += moveY * speed;
@@ -2604,7 +2954,7 @@ namespace phoenix::runtime
 
     std::string PhoenixRuntime::window_title(const std::string& /*rendererName*/, float /*fps*/, bool /*fogEnabled*/) const
     {
-        return "Phoenix Engine";
+        return "Phoenix Client";
     }
 
     // ---- World collision mesh ----
@@ -2893,7 +3243,7 @@ namespace phoenix::runtime
         std::vector<LadderVolume> volumes;
         for (const auto& obj : state_.sceneObjects)
         {
-            if (obj.deleted || obj.assetSlot < 0)
+            if (obj.deleted || !obj.loaded || obj.assetSlot < 0)
                 continue;
             if (obj.sectionIndex < 0
                 || static_cast<std::size_t>(obj.sectionIndex) >= state_.world.objectSections.size()
@@ -3039,7 +3389,7 @@ namespace phoenix::runtime
 
         for (const auto& obj : state_.sceneObjects)
         {
-            if (obj.deleted || obj.assetSlot < 0)
+            if (obj.deleted || !obj.loaded || obj.assetSlot < 0)
                 continue;
             const auto slot = static_cast<std::size_t>(obj.assetSlot);
             if (slot >= state_.worldAssets.size())

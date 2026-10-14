@@ -147,8 +147,9 @@ void main()
     }
 
     vec3 rgb = texRgb * vColor.rgb;
-    // Fade into fog instead of blending toward the sky color: additive-style
-    // particles have no sensible "mix with sky" behavior once blended.
+    // Ambient Godot materials participate in world fog. Fading transparent
+    // particles is the stable equivalent for additive and alpha blend modes;
+    // mixing fog RGB into an additive sprite would brighten the scene.
     float alpha = texAlpha * vColor.a * (1.0 - vFogFactor);
     if (alpha <= 0.003)
         discard;

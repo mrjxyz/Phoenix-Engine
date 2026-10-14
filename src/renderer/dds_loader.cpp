@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 namespace phoenix::renderer
 {
@@ -21,6 +22,7 @@ namespace phoenix::renderer
         constexpr std::uint32_t kVkFormatBc1RgbaUnormBlock = 133;
         constexpr std::uint32_t kVkFormatBc2UnormBlock = 135;
         constexpr std::uint32_t kVkFormatBc3UnormBlock = 137;
+        constexpr std::uint32_t kMaxTextureDimension = 32768;
 
         std::uint32_t read_u32(const std::uint8_t* ptr)
         {
@@ -49,15 +51,19 @@ namespace phoenix::renderer
             const auto planes = read_u16(data.data() + 26);
             const auto bitsPerPixel = read_u16(data.data() + 28);
             const auto compression = read_u32(data.data() + 30);
-            if (signedWidth <= 0 || signedHeight == 0 || planes != 1 || compression != 0
+            if (signedWidth <= 0 || signedHeight == 0
+                || signedHeight == std::numeric_limits<std::int32_t>::min()
+                || planes != 1 || compression != 0
                 || (bitsPerPixel != 24 && bitsPerPixel != 32))
                 return result;
 
             result.width = static_cast<std::uint32_t>(signedWidth);
             result.height = static_cast<std::uint32_t>(std::abs(signedHeight));
-            const auto bytesPerPixel = bitsPerPixel / 8;
-            const auto rowStride = ((result.width * bytesPerPixel + 3) / 4) * 4;
-            if (pixelOffset + static_cast<std::size_t>(rowStride) * result.height > data.size())
+            if (result.width > kMaxTextureDimension || result.height > kMaxTextureDimension)
+                return result;
+            const auto bytesPerPixel = static_cast<std::size_t>(bitsPerPixel / 8);
+            const auto rowStride = ((static_cast<std::size_t>(result.width) * bytesPerPixel + 3) / 4) * 4;
+            if (static_cast<std::size_t>(pixelOffset) + rowStride * result.height > data.size())
                 return result;
 
             result.rgba.assign(static_cast<std::size_t>(result.width) * result.height * 4, 255);
@@ -69,10 +75,12 @@ namespace phoenix::renderer
                 auto* dst = result.rgba.data() + static_cast<std::size_t>(y) * result.width * 4;
                 for (std::uint32_t x = 0; x < result.width; ++x)
                 {
-                    dst[x * 4 + 0] = src[x * bytesPerPixel + 2];
-                    dst[x * 4 + 1] = src[x * bytesPerPixel + 1];
-                    dst[x * 4 + 2] = src[x * bytesPerPixel + 0];
-                    dst[x * 4 + 3] = bytesPerPixel == 4 ? src[x * bytesPerPixel + 3] : 255;
+                    const auto sourceOffset = static_cast<std::size_t>(x) * bytesPerPixel;
+                    const auto destinationOffset = static_cast<std::size_t>(x) * 4;
+                    dst[destinationOffset + 0] = src[sourceOffset + 2];
+                    dst[destinationOffset + 1] = src[sourceOffset + 1];
+                    dst[destinationOffset + 2] = src[sourceOffset + 0];
+                    dst[destinationOffset + 3] = bytesPerPixel == 4 ? src[sourceOffset + 3] : 255;
                 }
             }
 
@@ -99,7 +107,7 @@ namespace phoenix::renderer
                 || (bitsPerPixel != 8 && bitsPerPixel != 24 && bitsPerPixel != 32))
                 return result;
 
-            const auto bytesPerPixel = bitsPerPixel / 8;
+            const auto bytesPerPixel = static_cast<std::size_t>(bitsPerPixel / 8);
             const auto pixelOffset = static_cast<std::size_t>(18) + idLength;
             const auto pixelCount = static_cast<std::size_t>(width) * height;
             if (pixelOffset + pixelCount * bytesPerPixel > data.size())
@@ -236,12 +244,12 @@ namespace phoenix::renderer
                     std::uint8_t pixels[16 * 4]{};
                     decode_bc1_block(src + (static_cast<std::size_t>(by) * blocksW + bx) * 8, pixels);
 
-                    for (int py = 0; py < 4; ++py)
+                    for (std::uint32_t py = 0; py < 4; ++py)
                     {
                         const auto row = by * 4 + py;
                         if (row >= height)
                             break;
-                        for (int px = 0; px < 4; ++px)
+                        for (std::uint32_t px = 0; px < 4; ++px)
                         {
                             const auto col = bx * 4 + px;
                             if (col >= width)
@@ -274,12 +282,12 @@ namespace phoenix::renderer
                     for (int i = 0; i < 16; ++i)
                         pixels[i * 4 + 3] = alphas[i];
 
-                    for (int py = 0; py < 4; ++py)
+                    for (std::uint32_t py = 0; py < 4; ++py)
                     {
                         const auto row = by * 4 + py;
                         if (row >= height)
                             break;
-                        for (int px = 0; px < 4; ++px)
+                        for (std::uint32_t px = 0; px < 4; ++px)
                         {
                             const auto col = bx * 4 + px;
                             if (col >= width)
@@ -312,12 +320,12 @@ namespace phoenix::renderer
                     for (int i = 0; i < 16; ++i)
                         pixels[i * 4 + 3] = alphas[i];
 
-                    for (int py = 0; py < 4; ++py)
+                    for (std::uint32_t py = 0; py < 4; ++py)
                     {
                         const auto row = by * 4 + py;
                         if (row >= height)
                             break;
-                        for (int px = 0; px < 4; ++px)
+                        for (std::uint32_t px = 0; px < 4; ++px)
                         {
                             const auto col = bx * 4 + px;
                             if (col >= width)
@@ -384,6 +392,11 @@ namespace phoenix::renderer
             result.valid = !result.rgba.empty();
             return result;
         }
+
+        if (extension == ".bmp")
+            return load_bmp(path);
+        if (extension == ".tga")
+            return load_tga(path);
 
         if (extension != ".dds")
             return {};
@@ -596,9 +609,10 @@ namespace phoenix::renderer
         {
             // Gather 4×4 pixel block.
             std::uint8_t px[16][4];
-            for (int y = 0; y < 4; ++y)
-                for (int x = 0; x < 4; ++x)
-                    std::memcpy(px[y * 4 + x], rgba + y * stride + x * 4, 4);
+            for (std::size_t y = 0; y < 4; ++y)
+                for (std::size_t x = 0; x < 4; ++x)
+                    std::memcpy(px[y * 4 + x],
+                        rgba + y * static_cast<std::size_t>(stride) + x * 4, 4);
 
             // ── Alpha block (8 bytes) ──
             std::uint8_t minA = 255, maxA = 0;
@@ -641,9 +655,12 @@ namespace phoenix::renderer
             std::uint8_t rMax = 0, gMax = 0, bMax = 0;
             for (auto& p : px)
             {
-                if (p[0] < rMin) rMin = p[0]; if (p[0] > rMax) rMax = p[0];
-                if (p[1] < gMin) gMin = p[1]; if (p[1] > gMax) gMax = p[1];
-                if (p[2] < bMin) bMin = p[2]; if (p[2] > bMax) bMax = p[2];
+                if (p[0] < rMin) rMin = p[0];
+                if (p[0] > rMax) rMax = p[0];
+                if (p[1] < gMin) gMin = p[1];
+                if (p[1] > gMax) gMax = p[1];
+                if (p[2] < bMin) bMin = p[2];
+                if (p[2] > bMax) bMax = p[2];
             }
 
             auto c0 = rgb565(rMax, gMax, bMax);
@@ -737,7 +754,7 @@ namespace phoenix::renderer
                 const auto x1 = std::min(srcW - 1, x0 + 1);
                 const float tx = std::clamp(sx - static_cast<float>(x0), 0.0f, 1.0f);
                 const auto dstOff = (static_cast<std::size_t>(y) * dstW + x) * 4;
-                for (int c = 0; c < 4; ++c)
+                for (std::size_t c = 0; c < 4; ++c)
                 {
                     const float c00 = src[(static_cast<std::size_t>(y0) * srcW + x0) * 4 + c];
                     const float c10 = src[(static_cast<std::size_t>(y0) * srcW + x1) * 4 + c];
@@ -902,9 +919,9 @@ namespace phoenix::renderer
                         const auto sx = x * 2, sy = y * 2;
                         const auto sx1 = std::min(sx + 1, mipW - 1);
                         const auto sy1 = std::min(sy + 1, mipH - 1);
-                        for (int c = 0; c < 4; ++c)
+                        for (std::uint32_t c = 0; c < 4; ++c)
                         {
-                            const unsigned v = currentRgba[(sy  * mipW + sx ) * 4 + c]
+                            const auto v = static_cast<std::uint32_t>(currentRgba[(sy * mipW + sx) * 4 + c])
                                              + currentRgba[(sy  * mipW + sx1) * 4 + c]
                                              + currentRgba[(sy1 * mipW + sx ) * 4 + c]
                                              + currentRgba[(sy1 * mipW + sx1) * 4 + c];

@@ -4,6 +4,7 @@
 #include "renderer/opengl_renderer.h"
 #include "world/character_loader.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -75,21 +76,20 @@ namespace phoenix::character
     {
         std::string raceFolder{ "Human" };
         std::string prefix{ "humf" };
+        // Canonical Godot starting appearance (CharacterRig.DEFAULT_LOADOUT).
         int upperIndex{ 19 };
         int lowerIndex{ 19 };
         int handIndex{ 19 };
         int footIndex{ 19 };
-        int helmetIndex{ 9 };
-        int faceIndex{ 1 };
-        int hairIndex{ 1 };
-        bool helmetVisible{ true };
-        // Weapon / shield. Default loadout: one-hand sword + light shield.
-        WeaponType weaponType{ WeaponType::Sword1H };
-        int weaponIndex{ 1 };    // RecordIndex in the weapon type CSV (-1 = none)
-        WeaponType shieldType{ WeaponType::ShieldLight };
-        int shieldIndex{ 1 };    // RecordIndex in the shield type CSV (-1 = none)
-        // Cloak. Default to cloak design 1.
-        int cloakIndex{ 1 };     // Index into CTL texture list (-1 = none)
+        int helmetIndex{ 10 };
+        int faceIndex{ 0 };
+        int hairIndex{ 0 };
+        bool helmetVisible{ false };
+        WeaponType weaponType{ WeaponType::None };
+        int weaponIndex{ -1 };   // RecordIndex in the weapon type CSV (-1 = none)
+        WeaponType shieldType{ WeaponType::None };
+        int shieldIndex{ -1 };   // RecordIndex in the shield type CSV (-1 = none)
+        int cloakIndex{ 22 };    // Index into CTL texture list (-1 = none)
         // Mount (vehicle). Vehicles are monsters game-mechanically; the rider
         // plays its mounted animations seated on a bone of the mount.
         bool mounted{ false };
@@ -138,13 +138,14 @@ namespace phoenix::character
         bool yawRight{};
         bool pitchUp{};
         bool pitchDown{};
-        bool cameraDrag{};
+        bool cameraOrbit{};       // either mouse button: orbit camera
+        bool cameraTurn{};        // right mouse button: also turn character
         float mouseDx{};
         float mouseDy{};
         float mouseWheel{};
         bool sit{};             // C key (toggle)
-        int emote{};            // 0=none, 1-10=emote number (one-shot from ImGui)
-        std::size_t debugAnimation{}; // 0=none, otherwise direct animation index (one-shot from ImGui)
+        int emote{};            // 0=none, 1-10=emote number (debug-panel one-shot)
+        std::size_t debugAnimation{}; // 0=none, otherwise direct animation index
     };
 
     // Holds all data for a loaded character (mesh, bones, animations).
@@ -457,14 +458,14 @@ namespace phoenix::character
         float render_ground_y() const;
         void set_world_position(float x, float y, float z, float yaw = 0.0f);
 
-        // Water tuning — adjustable at runtime via ImGui (absolute world Y; the
+        // Water tuning - adjustable at runtime via the debug panel (absolute world Y; the
         // water surface is Y=0). swimStartY: the character begins swimming once it
         // sinks to/below this height. floatLevelY: the height it bobs up to and
         // floats at while swimming. Kept separate so each can be matched to native.
-        float swimStartY{ -1.6f };
-        float floatLevelY{ -1.5f };
+        float swimStartY{ -1.35f };
+        float floatLevelY{ -1.25f };
 
-        // Bone attachment indices — adjustable at runtime via ImGui.
+        // Bone attachment indices - adjustable at runtime via the debug panel.
         int weaponBoneIndex{ 11 };   // default: right wrist
         int shieldBoneIndex{ 21 };   // default: left wrist
         int cloakBodyBoneIndex{ 4 };    // default: upper spine/chest
@@ -472,7 +473,7 @@ namespace phoenix::character
         int mountBoneIndex{ 25 };       // mount bone the rider is seated on
         int dualWeaponBoneIndex{ 21 };  // off-hand dual weapon: default left wrist
 
-        // Dual-wield off-hand fine adjustment — adjustable at runtime via ImGui.
+        // Dual-wield off-hand fine adjustment - adjustable in the debug panel.
         // Applied in the off-hand bone's local space before the bone transform:
         // rotate (Euler XYZ, degrees) then translate. Persisted across reloads
         // (not reset by load()) so values can be tuned live against retail.
@@ -534,12 +535,13 @@ namespace phoenix::character
         float cameraYaw_{};
         float cameraPitch_{ -0.16f };
         float cameraDistance_{ 6.2f };
+        float targetCameraDistance_{ 6.2f };
         float smoothCameraY_{};   // EMA-smoothed camera target Y (eliminates terrain jitter)
         float smoothX_{};         // EMA-smoothed render position
         float smoothY_{};
         float smoothZ_{};
-        mutable float cameraTerrainLift_{};
-        mutable bool cameraTerrainLiftInitialized_{};
+        mutable float collisionCameraDistance_{ 6.2f };
+        mutable bool collisionCameraInitialized_{};
         float animationSeconds_{};
         std::size_t activeAnimation_{};
         std::size_t previousAnimation_{};
@@ -588,6 +590,11 @@ namespace phoenix::character
         bool lastBackward_{};
         bool lastLeft_{};
         bool lastRight_{};
+        // Pure back/left/right clips settle briefly when rapidly switching
+        // between them, matching the Godot controller and avoiding restarts.
+        int specialStepRequest_{};   // 0 none, 1 back, 2 left, 3 right
+        int specialStepActive_{};
+        float specialStepElapsed_{};
         float dodgePlayTimer_{};   // >0 while dodge animation is playing
         std::size_t dodgeAnimation_{};
         float dodgeDirX_{};
@@ -607,11 +614,12 @@ namespace phoenix::character
         // bind grid spacing. Solved with position-based Verlet each frame.
         std::vector<float> clothWorld_;     // 3*N current world positions
         std::vector<float> clothPrev_;      // 3*N previous world positions (Verlet)
-        std::vector<float> clothRefNormals_; // 3*N scratch: pre-recompute normals, reused instead of a fresh per-frame vector
         std::vector<float> clothRestUp_;    // per-vertex rest length to row above (world units)
         std::vector<float> clothRestLeft_;  // per-vertex rest length to col to the left
         std::vector<std::uint32_t> clothPinBody_;  // per-column: skinned body vertex the top row follows
-        std::vector<float> clothPinOffset_;        // per-column local offset (3 each): cloak bind - body bind
+        // Godot deliberately closes the authored seam between the two cloak
+        // pieces, then applies a small per-rig correction from its cloth profile.
+        std::array<float, 3> cloakShoulderOffset_{};
         std::uint32_t clothRows_{};
         static constexpr std::uint32_t kClothCols = 5;
         bool clothInitialized_{};

@@ -17,6 +17,7 @@
 #include "runtime/celestial_system.h"
 #include "runtime/star_field.h"
 #include "runtime/phoenix_runtime.h"
+#include "runtime/world_streamer.h"
 #include "platform/sdl_window.h"
 #include "renderer/dds_loader.h"
 #include "renderer/visibility_culling.h"
@@ -25,9 +26,8 @@
 #include "ui/editor_panel.h"
 #include "ui/loading_screen.h"
 #include "ui/perf_hud.h"
+#include "ui/phoenix_ui.h"
 #include "ui/weather_overlay.h"
-
-#include "imgui.h"
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +62,24 @@ namespace
         std::vector<phoenix::world::EftMesh> meshes;
     };
 
+    struct StreamedWorldScene
+    {
+        phoenix::runtime::StaticObjectScene staticObjects;
+        phoenix::runtime::AnimatedObjectScene animatedObjects;
+        phoenix::runtime::WorldCollisionMesh collision;
+        std::vector<phoenix::runtime::PhoenixRuntime::LadderVolume> ladders;
+    };
+
+    struct StreamedTerrainScene
+    {
+        std::vector<phoenix::renderer::TerrainVertex> vertices;
+        std::vector<std::uint32_t> indices;
+        phoenix::runtime::PhoenixRuntime::TerrainLodInfo lod;
+        float centerX{};
+        float centerZ{};
+        float residentDistance{};
+    };
+
     // UI types/functions live in ui/editor_panel.{h,cpp} and ui/perf_hud.{h,cpp}.
     using phoenix::ui::WeatherMode;
     using phoenix::ui::CharacterOption;
@@ -85,7 +103,6 @@ namespace
     using phoenix::renderer::build_visible_animated_batches;
     using phoenix::renderer::build_visible_object_batches;
     using phoenix::renderer::build_visible_terrain_ranges;
-    using phoenix::renderer::extract_gpu_bounds;
     using phoenix::renderer::project_world_to_screen;
     using phoenix::renderer::sort_scene_front_to_back;
     using phoenix::renderer::sphere_visible;
@@ -95,11 +112,21 @@ namespace
     using phoenix::character::scan_bot_equipment_pools;
     using phoenix::character::scan_character_options;
 
-    constexpr const char* kAppTitle = "Phoenix Engine";
+    constexpr const char* kAppTitle = "Phoenix Client";
     constexpr std::size_t kSkyTextureLayer = 63;
     constexpr std::size_t kPrimaryCloudTextureLayer = 64;
     constexpr std::size_t kSecondaryCloudTextureLayer = 65;
     constexpr std::size_t kAssetTextureLayerBase = 66;
+    // A 384-layer pool was too small for the predictive ring on asset-dense
+    // fields: geometry whose last texture could not lease a layer was dropped.
+    // 768 remains bounded while covering those resident working sets.
+    constexpr std::size_t kWorldAssetTextureSlotReserve = 768;
+    constexpr std::uint32_t kWorldAssetTextureSize = 256;
+    constexpr std::uint32_t kWorldAssetTextureMipLevels = 7;
+    constexpr std::size_t kCharacterTextureSlotReserve = 32;
+    constexpr std::size_t kBotTextureSlotReserve = 256;
+    constexpr std::size_t kNpcTextureSlotReserve = 96;
+    constexpr std::size_t kMonsterTextureSlotReserve = 256;
 
 }
 
@@ -113,7 +140,7 @@ int main(int, char**)
     phoenix::platform::SdlWindow window;
     if (!window.create(kWidth, kHeight, kAppTitle))
     {
-        std::fprintf(stderr, "Could not create Phoenix Engine window.\n");
+        std::fprintf(stderr, "Could not create Phoenix Client window.\n");
         return 1;
     }
 
@@ -128,7 +155,7 @@ int main(int, char**)
         return 1;
     }
 
-    const auto imguiAvailable = renderer.initialize_imgui(window.handle());
+    const auto uiAvailable = renderer.native_ui_available();
 
     phoenix::app::LoadingScheduler cpuLoader(phoenix::app::LoadingWorkKind::Cpu);
     phoenix::app::LoadingScheduler ioLoader(phoenix::app::LoadingWorkKind::Io);
@@ -137,10 +164,18 @@ int main(int, char**)
     perfHud.gpuName = renderer.adapter_name();
     perfHud.renderer = &renderer;
     perfHud.antialiasingAvailable = window.has_multisample_context();
-    phoenix::ui::DisplaySettings displaySettings{};
-    if (imguiAvailable)
-        phoenix::ui::register_app_settings(displaySettings.characterShadow, perfHud.fpsCapIndex, perfHud.antialiasingEnabled);
+    phoenix::ui::GraphicsSettings graphicsSettings{};
+    phoenix::ui::register_app_settings(
+        graphicsSettings.worldShadows,
+        graphicsSettings.terrainCompatibility,
+        graphicsSettings.vsyncEnabled,
+        perfHud.fpsCapIndex,
+        perfHud.antialiasingEnabled);
+    if (!renderer.set_vsync_enabled(graphicsSettings.vsyncEnabled))
+        graphicsSettings.vsyncEnabled = false;
     renderer.set_antialiasing_enabled(perfHud.antialiasingAvailable && perfHud.antialiasingEnabled);
+    renderer.set_shadows_enabled(graphicsSettings.worldShadows);
+    renderer.set_terrain_compatibility(graphicsSettings.terrainCompatibility);
 
     // Closing the window must work even mid-load: skip all teardown and let
     // the OS reclaim the process — waiting on loaders/GPU only delays the user.
@@ -194,6 +229,13 @@ int main(int, char**)
 
     phoenix::runtime::PhoenixRuntime runtime;
     runAsyncVoid([&]() { runtime.initialize(executableDir, false); }, 0.06f, "Indexing data");
+    const auto reservedDynamicLayers = kCharacterTextureSlotReserve + kBotTextureSlotReserve
+        + kNpcTextureSlotReserve + kMonsterTextureSlotReserve;
+    const auto arrayLayerLimit = renderer.max_texture_array_layers();
+    const auto maxWorldAssetTextureLayers = arrayLayerLimit > kAssetTextureLayerBase + reservedDynamicLayers
+        ? static_cast<std::size_t>(arrayLayerLimit - kAssetTextureLayerBase - reservedDynamicLayers)
+        : 1u;
+    runtime.set_asset_texture_capacity(static_cast<std::uint32_t>(maxWorldAssetTextureLayers));
     showLoading(0.12f, "Indexing data");
 
     // Character system. Its catalog preload runs after the world load (each phase
@@ -233,14 +275,10 @@ int main(int, char**)
     }, 0.31f, "Scanning equipment");
     npcManager.load_catalog(runtime.state().assets.root);
     monsterManager.load_catalog(runtime.state().assets.root);
-    // The full character/item caches (all races + BC3 textures, ~93MB, several
-    // seconds) used to be built synchronously here. To launch fast we now skip that:
-    // the default character (Humf on map 1) loads via on-demand disk fallback, and
-    // the heavy preload runs in a background thread after the world is ready (see
-    // backgroundAssetThread below). assetsFullyLoaded gates the appearance UI until
-    // the caches exist, so appearance swaps remain instant and race-free.
-    std::atomic<bool> assetsFullyLoaded{ false };
-    std::thread backgroundAssetThread;
+    // Character and item meshes are resolved on demand. Preloading every race,
+    // animation and weapon retained roughly 800 MiB of session-global CPU data
+    // shortly after the first map appeared, obscuring map teardown and making
+    // the first reload look like a duplicated world.
     showLoading(0.32f, "Characters");
     int selectedCharacterOption = 0;
     for (std::size_t i = 0; i < characterOptions.size(); ++i)
@@ -268,12 +306,18 @@ int main(int, char**)
         fogCullDistance = apply_renderer_fog(renderer, runtime, fogEnabled, viewDistance, weatherMode);
     };
     applyFogSettings();
-    int pendingEmote = 0;   // emote triggered from ImGui, consumed next frame
-    std::size_t pendingAnimation = 0; // animation test triggered from ImGui, consumed next frame
+    int pendingEmote = 0;   // emote triggered from the debug panel, consumed next frame
+    std::size_t pendingAnimation = 0; // animation test triggered from the debug panel
 
     std::uint32_t terrainVertexCount{};
     std::uint32_t terrainIndexCount{};
     phoenix::runtime::PhoenixRuntime::TerrainLodInfo terrainLodInfo;
+    float terrainResidencyCenterX{};
+    float terrainResidencyCenterZ{};
+    float terrainResidencyDistance{};
+    std::vector<phoenix::renderer::TerrainDrawRange> visibleTerrainRanges;
+    std::vector<phoenix::renderer::ObjectBatch> visibleBatches;
+    std::vector<phoenix::renderer::ObjectBatch> visibleAnimatedBatches;
     std::uint32_t objectInstanceCount{};
     std::uint32_t objectBatchCount{};
     bool playMapSounds = true;
@@ -285,10 +329,10 @@ int main(int, char**)
     phoenix::runtime::StaticObjectScene staticObjectScene;
     phoenix::runtime::AnimatedObjectScene animatedObjectScene;
     phoenix::runtime::EffectParticleSystem effectParticleSystem;
+    phoenix::runtime::WorldStreamer worldStreamer;
+    std::optional<std::future<StreamedWorldScene>> streamedSceneBuild;
+    std::optional<std::future<StreamedTerrainScene>> streamedTerrainBuild;
     phoenix::runtime::WeatherParticleSystem weatherParticleSystem;
-    phoenix::runtime::CelestialSystem celestialSystem;
-    phoenix::runtime::StarField starField;
-    starField.build(); // fixed star directions, independent of map/runtime state — generated once
     // Debug "Effects" panel: the full data/effects catalog (built once, lazily,
     // since it's independent of the loaded map), the currently selected file's
     // loaded/resolved library (cached by path so re-selecting is instant), and
@@ -296,11 +340,10 @@ int main(int, char**)
     std::vector<std::filesystem::path> effectLibraryFilePaths;
     std::vector<std::string> effectFileNames;
     std::unordered_map<std::string, DebugEffectLibraryEntry> effectLibraryCache;
-    // Raw (unnormalized) textures for every distinct debug-loaded file so
-    // far, append-only — re-normalized and re-uploaded as a whole each time a
-    // new file is added, since the dedicated debug array needs one uniform
-    // format/resolution across all its layers (same constraint the shared
-    // terrain array has).
+    // Paths are the persistent source of truth. DDS payloads are only transient
+    // upload staging; keeping every mip in RAM after the GPU upload retained
+    // hundreds of MiB for the entire session.
+    std::vector<std::filesystem::path> debugEffectTexturePaths;
     std::vector<phoenix::renderer::DdsTexture> debugEffectTexturesRaw;
     int selectedEffectFileIndex = 0;
     int selectedEffectSequenceIndex = 0;
@@ -316,30 +359,6 @@ int main(int, char**)
     struct PendingBotEffect { std::uint32_t spawnId; float age; };
     std::vector<PendingBotEffect> pendingBotEffects;
     std::mt19937 botCastRng{ std::random_device{}() };
-
-    // Background (non-blocking) warm-up of every bot-castable effect file.
-    // Loading each file lazily, one at a time, the moment some bot happens
-    // to roll it for the first time is what previously destroyed framerate:
-    // each newly-discovered file forces a full re-normalize + re-upload of
-    // the whole shared debug texture array (see debugEffectTexturesDirty),
-    // and with ~100 bots casting semi-randomly that meant many full-array
-    // rebuilds in quick succession. Loading everything up front on the main
-    // thread (an earlier fix attempt) avoided that but stalled map load
-    // instead. This does the CPU-side work (parsing + DDS decode, no GL
-    // calls) on a cpuLoader worker thread while the game keeps rendering,
-    // then merges the results and uploads textures exactly once (see the
-    // merge block next to botManager.update()).
-    struct PreloadedBotEffect
-    {
-        std::filesystem::path path;
-        phoenix::world::EftLibrary library;
-        std::vector<phoenix::world::EftMesh> meshes;
-        std::vector<std::filesystem::path> texturePaths;
-        std::vector<phoenix::renderer::DdsTexture> textures; // parallel to texturePaths
-    };
-    std::future<std::vector<PreloadedBotEffect>> botEffectPreloadFuture;
-    bool botEffectPreloadKicked = false;
-    bool botEffectPreloadReady = false;
     // Diagnostic isolation: raw component index (library.effects), spawned
     // directly via the panel's "Spawn component" button, bypassing sequence
     // expansion.
@@ -357,7 +376,7 @@ int main(int, char**)
         if (!characterLoaded || !characterSystem.ready())
             return;
         phoenix::app::set_character_mesh(renderer, characterSystem, playableMode,
-            displaySettings.characterShadow);
+            graphicsSettings.worldShadows);
     };
 
     const auto releaseDecodedTextureRam = [](std::vector<phoenix::renderer::DdsTexture>& textures) {
@@ -375,7 +394,7 @@ int main(int, char**)
         float progressStart = 0.0f,
         float progressEnd = 0.0f,
         // Caps the generated mip chain. Regular game assets always ship
-        // pre-baked mips through the canonical dds_normalize pipeline, so
+        // with pre-baked mips through the production data pipeline, so
         // this only matters for content normalised on the fly here (the
         // debug "Effects" panel's textures): mip generation box-filters 2x2
         // neighborhoods repeatedly, which is fine for a normal single-image
@@ -415,9 +434,9 @@ int main(int, char**)
             static_cast<std::uint32_t>(std::max(1.0, std::log2(static_cast<double>(maxDim)) - 1.0)),
             std::max(1u, maxMipLevels) });
 
-        // The data tree is pre-normalised to canonical BC3 + full mip chain
-        // (via the standalone dds_normalize tool), so conversion is the
-        // exception: collect only the non-canonical entries (foreign data,
+        // The data tree uses canonical BC3 textures with full mip chains, so
+        // conversion is the exception. Collect only non-canonical entries
+        // (foreign data,
         // broken files, empty reserved slots that need a fallback fill) and
         // convert just those.
         std::vector<std::size_t> pending;
@@ -484,7 +503,7 @@ int main(int, char**)
             future.get();
     };
 
-    // True whenever debugEffectTexturesRaw has grown since the last upload —
+    // True whenever debugEffectTexturePaths has grown since the last upload —
     // checked once per frame (see the flush next to the pendingBotEffects
     // sweep) instead of uploading inline in ensureEffectLibraryLoaded. Doing
     // it inline meant every newly-discovered file — whether from a bot
@@ -515,7 +534,7 @@ int main(int, char**)
             entry.library = std::move(loaded.library);
             entry.meshes = std::move(loaded.meshes);
 
-            const auto baseLayer = debugEffectTexturesRaw.size();
+            const auto baseLayer = debugEffectTexturePaths.size();
             entry.textureLayers.reserve(loaded.texturePaths.size());
             for (std::size_t i = 0; i < loaded.texturePaths.size(); ++i)
             {
@@ -523,11 +542,11 @@ int main(int, char**)
                 if (texturePath.empty())
                 {
                     entry.textureLayers.push_back(0xFFFFFFFFu);
-                    debugEffectTexturesRaw.push_back({});
+                    debugEffectTexturePaths.emplace_back();
                     continue;
                 }
                 entry.textureLayers.push_back(0x80000000u | static_cast<std::uint32_t>(baseLayer + i));
-                debugEffectTexturesRaw.push_back(phoenix::renderer::load_dds(texturePath));
+                debugEffectTexturePaths.push_back(texturePath);
                 debugEffectTexturesDirty = true;
             }
 
@@ -545,13 +564,12 @@ int main(int, char**)
     // force-cleaned at 10s if it doesn't finish on its own (see the
     // pendingBotEffects sweep next to botManager.update()).
     botManager.onCastEffect = [&](float x, float y, float z, float yaw) {
-        // Skip casts entirely until the background preload has merged (see
-        // botEffectPreloadReady) — falling back to ensureEffectLibraryLoaded
-        // here for a not-yet-cached file would re-introduce the per-file
-        // synchronous load + full-array texture rebuild that used to tank
-        // framerate. Once ready, every file is already cached, so this is
-        // just a fast lookup from then on.
-        if (botEffectFilePaths.empty() || !botEffectPreloadReady)
+        // This is deliberately lazy. Preloading every castable effect in the
+        // background retained a large CPU/GPU texture library unrelated to
+        // the current map and made the first map reload appear to double RAM.
+        // botEffectFilePaths is capped when the catalog is built, so demand
+        // loading also has a hard upper memory bound.
+        if (botEffectFilePaths.empty())
             return;
         const auto& path = botEffectFilePaths[botCastRng() % botEffectFilePaths.size()];
         auto& entry = ensureEffectLibraryLoaded(path);
@@ -565,21 +583,18 @@ int main(int, char**)
             pendingBotEffects.push_back({ id, 0.0f });
     };
 
-    // Warms effectLibraryCache/debugEffectTexturesRaw for every bot-castable
-    // file in ONE batched pass (called once, right after botEffectFilePaths
-    constexpr std::size_t kCharacterTextureSlotReserve = 32;
-    constexpr std::size_t kBotTextureSlotReserve = 256;
-    constexpr std::size_t kNpcTextureSlotReserve = 96;
-    constexpr std::size_t kMonsterTextureSlotReserve = 256;
+    std::size_t botTextureBaseSlot = 0;
     std::size_t npcTextureBaseSlot = 0;
     std::size_t monsterTextureBaseSlot = 0;
+    std::optional<std::future<std::vector<phoenix::renderer::DdsTexture>>> botPresetBuild;
+    int pendingBotSpawnCount = 0;
 
     const auto reloadCharacterIntoRenderer = [&]() {
         if (characterTextureBaseSlot == 0 || !terrainTexturesUploaded)
             return false;
 
         characterLoaded = characterSystem.load(
-            runtime.state().assets.root, characterAppearance, assetsFullyLoaded.load());
+            runtime.state().assets.root, characterAppearance, /*allowPreload=*/false);
         if (!characterLoaded)
             return false;
 
@@ -598,7 +613,7 @@ int main(int, char**)
 
         // Fast mesh update: reuses existing GPU buffers, no vkDeviceWaitIdle.
         phoenix::app::update_character_mesh(renderer, characterSystem, playableMode,
-            displaySettings.characterShadow);
+            graphicsSettings.worldShadows);
         return true;
     };
 
@@ -609,16 +624,37 @@ int main(int, char**)
         mapAudioScene = build_map_audio_scene(runtime);
         const auto texturePaths = runtime.terrain_texture_paths();
         const auto waterTexturePath = runtime.water_texture_path();
-        const auto skyTexturePath = runtime.texture_path_for(runtime.state().world.skyFileName);
-        const auto primaryCloudTexturePath = runtime.texture_path_for(runtime.state().world.primaryCloudFileName);
-        const auto secondaryCloudTexturePath = runtime.texture_path_for(runtime.state().world.secondaryCloudFileName);
-        const auto assetTexturePaths = runtime.asset_texture_paths();
+        const bool dungeonEnvironment = runtime.state().world.isDungeon;
+        // Dungeons use a pure-black environment. Do not resolve, decode or
+        // upload outdoor sky/cloud resources just because their WLD fields
+        // happen to contain inherited names.
+        const auto skyTexturePath = dungeonEnvironment
+            ? std::filesystem::path{}
+            : runtime.texture_path_for(runtime.state().world.skyFileName);
+        const auto primaryCloudTexturePath = dungeonEnvironment
+            ? std::filesystem::path{}
+            : runtime.texture_path_for(runtime.state().world.primaryCloudFileName);
+        const auto secondaryCloudTexturePath = dungeonEnvironment
+            ? std::filesystem::path{}
+            : runtime.texture_path_for(runtime.state().world.secondaryCloudFileName);
+        const auto& assetTexturePaths = runtime.asset_texture_paths();
 
         runtime.load_water_animation();
         const auto& waterAnim = runtime.water_animation();
+        // Water frames live between the asset pool and dynamic characters, so
+        // account for them before fixing the immutable array layout.
+        const auto maxSafeWorldAssetTextureLayers = arrayLayerLimit
+                > kAssetTextureLayerBase + waterAnim.frameCount + reservedDynamicLayers
+            ? static_cast<std::size_t>(arrayLayerLimit - kAssetTextureLayerBase
+                - waterAnim.frameCount - reservedDynamicLayers)
+            : 1u;
+        const auto assetTextureLayerCount = runtime.uses_world_asset_streaming()
+            ? std::min(maxSafeWorldAssetTextureLayers,
+                std::max(kWorldAssetTextureSlotReserve, assetTexturePaths.size()))
+            : assetTexturePaths.size();
         const auto waterLayout = phoenix::app::make_water_resource_layout(
             kAssetTextureLayerBase,
-            assetTexturePaths.size(),
+            assetTextureLayerCount,
             waterAnim.frameCount);
         characterTextureBaseSlot = waterLayout.firstFreeLayer;
         std::vector<phoenix::renderer::DdsTexture> terrainTextures(characterTextureBaseSlot);
@@ -703,7 +739,7 @@ int main(int, char**)
         // Load character textures into the texture array after water frames.
         // Reserve character + bot slots so appearance swaps and bot spawns don't resize the GPU array.
         {
-            const auto botTextureBaseSlot = characterTextureBaseSlot + kCharacterTextureSlotReserve;
+            botTextureBaseSlot = characterTextureBaseSlot + kCharacterTextureSlotReserve;
             npcTextureBaseSlot = botTextureBaseSlot + kBotTextureSlotReserve;
             monsterTextureBaseSlot = npcTextureBaseSlot + kNpcTextureSlotReserve;
             const auto reservedEnd = monsterTextureBaseSlot + kMonsterTextureSlotReserve;
@@ -721,7 +757,7 @@ int main(int, char**)
             {
                 characterLoaded = runAsync([&]() {
                     return characterSystem.load(
-                        runtime.state().assets.root, characterAppearance, assetsFullyLoaded.load());
+                        runtime.state().assets.root, characterAppearance, /*allowPreload=*/false);
                 }, 0.66f, "Preparing character");
                 if (characterLoaded)
                 {
@@ -735,44 +771,18 @@ int main(int, char**)
                 loadCharTextures();
             }
 
-            if (characterLoaded)
-            {
-                runAsync([&]() {
-                    return botManager.build_random_presets(
-                        runtime.state().assets.root,
-                        characterOptions,
-                        botEquipmentPools,
-                        static_cast<std::uint32_t>(botTextureBaseSlot),
-                        kBotTextureSlotReserve,
-                        terrainTextures,
-                        assetsFullyLoaded.load());
-                }, 0.67f, "Preparing bot presets");
-            }
         }
 
         showLoading(0.68f, "Uploading textures");
         if (!terrainTextures.empty())
         {
-            // Log pre-normalisation format census.
-            {
-                std::uint32_t countBc1{}, countBc3{}, countRgba{}, countInvalid{};
-                std::map<std::string, std::uint32_t> sizeDistribution;
-                for (const auto& t : terrainTextures)
-                {
-                    if (!t.valid) { ++countInvalid; continue; }
-                    auto sizeKey = std::to_string(t.width) + "x" + std::to_string(t.height);
-                    sizeDistribution[sizeKey]++;
-                    if (t.compressed && t.vkFormat == phoenix::renderer::kDdsFormatBc1RgbaUnormBlock) ++countBc1;
-                    else if (t.compressed && (t.vkFormat == phoenix::renderer::kDdsFormatBc3UnormBlock || t.vkFormat == phoenix::renderer::kDdsFormatBc2UnormBlock)) ++countBc3;
-                    else ++countRgba;
-                }
-            }
-
             showLoading(0.70f, "Normalising textures to BC3");
             normalizeTexturesForBcUpload(terrainTextures, "Normalising textures to BC3", 0.70f, 0.735f);
 
             showLoading(0.74f, "Uploading BC3 textures");
-            terrainTexturesUploaded = renderer.upload_terrain_textures(terrainTextures, pumpQuitCheck);
+            terrainTexturesUploaded = renderer.upload_terrain_textures(terrainTextures, pumpQuitCheck,
+                static_cast<std::uint32_t>(kAssetTextureLayerBase),
+                static_cast<std::uint32_t>(assetTextureLayerCount));
             if (terrainTexturesUploaded)
             {
                 releaseDecodedTextureRam(terrainTextures);
@@ -781,6 +791,28 @@ int main(int, char**)
                     std::vector<std::vector<std::uint8_t>>().swap(t.mipData);
             }
         }
+
+        if (runtime.uses_world_asset_streaming())
+        {
+            // World-prop DDS files are authored at 256x256. Before streaming,
+            // those files participated in the global array-size vote; once
+            // they became lazy, terrain/effects incorrectly selected 128x128
+            // and every streamed prop was destructively resampled. Keep the
+            // resident prop pool at its canonical size without inflating the
+            // much larger terrain/character array.
+            renderer.configure_streamed_asset_texture_pool(
+                static_cast<std::uint32_t>(kAssetTextureLayerBase),
+                static_cast<std::uint32_t>(assetTextureLayerCount),
+                kWorldAssetTextureSize, kWorldAssetTextureSize,
+                kWorldAssetTextureMipLevels);
+        }
+        worldStreamer.configure(
+            runtime,
+            renderer,
+            cpuLoader,
+            static_cast<std::uint32_t>(kAssetTextureLayerBase),
+            static_cast<std::uint32_t>(assetTextureLayerCount),
+            assetTexturePaths);
 
         const auto& world = runtime.state().world;
 
@@ -949,7 +981,17 @@ int main(int, char**)
         std::vector<phoenix::renderer::TerrainVertex> waterVertices;
         std::vector<std::uint32_t> waterIndices;
 
-        runAsyncVoid([&]() { runtime.build_terrain_mesh(terrainVertices, terrainIndices, terrainLodInfo); }, 0.74f, "Building terrain");
+        terrainResidencyCenterX = 0.0f;
+        terrainResidencyCenterZ = 0.0f;
+        terrainResidencyDistance = std::max(420.0f, fogCullDistance + 192.0f);
+        runAsyncVoid([&]() {
+            if (runtime.uses_world_asset_streaming())
+                runtime.build_streamed_terrain_mesh(terrainVertices, terrainIndices,
+                    terrainLodInfo, terrainResidencyCenterX, terrainResidencyCenterZ,
+                    terrainResidencyDistance);
+            else
+                runtime.build_terrain_mesh(terrainVertices, terrainIndices, terrainLodInfo);
+        }, 0.74f, "Building nearby terrain");
         phoenix::app::build_water_mesh(
             static_cast<float>(std::max(1u, runtime.state().world.mapSize)),
             waterVertices,
@@ -974,6 +1016,24 @@ int main(int, char**)
           std::vector<std::uint32_t>().swap(terrainIndices);
           std::vector<phoenix::renderer::TerrainVertex>().swap(waterVertices);
           std::vector<std::uint32_t>().swap(waterIndices); }
+
+        // Settle only the spawn-area residency while the loading screen is
+        // already visible. This mirrors Godot's initial-near settle: the map
+        // becomes playable with its immediate collision/props present, while
+        // every distant sector remains cold and continues to stream later.
+        if (worldStreamer.active())
+        {
+            for (;;)
+            {
+                const auto streamed = worldStreamer.update(
+                    terrainResidencyCenterX, terrainResidencyCenterZ,
+                    fogCullDistance);
+                showLoading(0.80f, "Streaming spawn area");
+                if (streamed.pendingAssets == 0)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            }
+        }
 
         staticObjectScene = runAsync([&runtime]() {
             return runtime.build_static_object_scene();
@@ -1003,6 +1063,14 @@ int main(int, char**)
                     botEffectFilePaths.push_back(path);
             }
 
+            // Bot effects are incidental ambience, not map content. Keep a
+            // small randomized selection so repeated casts cannot gradually
+            // populate the session with the whole effects library.
+            constexpr std::size_t kMaxBotEffectLibraries = 4;
+            std::shuffle(botEffectFilePaths.begin(), botEffectFilePaths.end(), botCastRng);
+            if (botEffectFilePaths.size() > kMaxBotEffectLibraries)
+                botEffectFilePaths.resize(kMaxBotEffectLibraries);
+
             // load_effect_library_file() resolves everything against the
             // session-wide DataIndex (state_.assets), not per-map data — so
             // unlike the main terrain/asset texture array, effectLibraryCache/
@@ -1010,51 +1078,15 @@ int main(int, char**)
             // changes and this only needs to run once, ever.
         }
 
-        // Kick the background warm-up of every bot-castable file once, ever
-        // (see PreloadedBotEffect / botEffectPreloadReady). Runs on a
-        // cpuLoader worker thread — CPU-only work (parse + DDS decode, no GL
-        // calls), so it doesn't block map loading. Bots simply skip casting
-        // until it's merged (see botManager.onCastEffect).
-        if (!botEffectPreloadKicked)
-        {
-            botEffectPreloadKicked = true;
-            auto pathsToLoad = botEffectFilePaths;
-            botEffectPreloadFuture = cpuLoader.submit([&runtime, pathsToLoad]() {
-                std::vector<PreloadedBotEffect> results;
-                results.reserve(pathsToLoad.size());
-                for (const auto& path : pathsToLoad)
-                {
-                    auto loaded = runtime.load_effect_library_file(path);
-                    PreloadedBotEffect item{};
-                    item.path = path;
-                    item.library = std::move(loaded.library);
-                    item.meshes = std::move(loaded.meshes);
-                    item.texturePaths = std::move(loaded.texturePaths);
-                    item.textures.reserve(item.texturePaths.size());
-                    for (const auto& texturePath : item.texturePaths)
-                        item.textures.push_back(texturePath.empty()
-                            ? phoenix::renderer::DdsTexture{}
-                            : phoenix::renderer::load_dds(texturePath));
-                    results.push_back(std::move(item));
-                }
-                return results;
-            });
-        }
         loadedEffectFileIndex = -1;
         effectSequenceNames.clear();
         objectInstanceCount = static_cast<std::uint32_t>(staticObjectScene.instances.size());
         objectBatchCount = static_cast<std::uint32_t>(staticObjectScene.batches.size());
-        {
-        }
-        const bool staticObjectsReady = renderer.set_static_object_mesh(
+        renderer.set_static_object_mesh(
             staticObjectScene.vertices,
             staticObjectScene.indices,
             staticObjectScene.instances,
             staticObjectScene.batches);
-
-        // Upload indirect draw data for GPU frustum culling.
-        if (staticObjectsReady)
-            renderer.upload_indirect_draw_data(staticObjectScene.batches, extract_gpu_bounds(staticObjectScene));
 
         // Upload animated object mesh to GPU. Always called, even when this map has
         // no vertex-animated (VANI) objects: set_animated_object_mesh() destroys the
@@ -1086,15 +1118,12 @@ int main(int, char**)
         // ---- Release CPU-side data already uploaded to GPU ----
         // Vertices and indices are now in GPU buffers; free CPU copies.
         {
-            std::size_t freedMB = 0;
-            const auto countBytes = [](auto& vec) {
-                const auto bytes = vec.capacity() * sizeof(typename std::remove_reference_t<decltype(vec)>::value_type);
+            const auto releaseVector = [](auto& vec) {
                 vec.clear();
                 vec.shrink_to_fit();
-                return bytes;
             };
-            freedMB += countBytes(staticObjectScene.vertices);
-            freedMB += countBytes(staticObjectScene.indices);
+            releaseVector(staticObjectScene.vertices);
+            releaseVector(staticObjectScene.indices);
         }
 
         // Upload character mesh (initial bind pose).
@@ -1142,32 +1171,27 @@ int main(int, char**)
         showLoading(1.0f, "Ready");
 
         phoenix::app::release_memory_to_os();
+        // Commit presentation atomically: all earlier showLoading() calls stay
+        // on the loading image even though terrain/water/object uploads have
+        // already marked their individual renderer resources ready.
+        renderer.leave_loading_mode();
     };
 
     uploadCurrentWorld();
     applyFogSettings();
     window.set_title(kAppTitle);
 
-    // World + default character are up and the window is interactive. Now build the
-    // full character/item caches (all races + BC3 textures) off the main thread so
-    // the rest of the content streams in without blocking play. assetsFullyLoaded is
-    // flipped when done; the appearance UI stays disabled until then so there is no
-    // concurrent reader of the caches while this thread writes them.
-    backgroundAssetThread = std::thread([&]() {
-        // Lower the thread priority so the background preload yields CPU to the
-        // game loop. Before the deferred-loading change this work ran during the
-        // loading screen (invisible spike); now it runs while the game is
-        // interactive, so it must not compete with rendering.
-        phoenix::app::set_current_thread_loading_priority();
-        characterSystem.preload(runtime.state().assets.root);
-        characterSystem.preload_items(runtime.state().assets.root);
-        assetsFullyLoaded.store(true);
-    });
-
     using clock = std::chrono::steady_clock;
     auto lastFrame = clock::now();
     float totalTime = 0.0f;
     bool playToggleWasDown = false;
+    bool orbitPointerWasDown = false;
+    bool orbitCapturePending = false;
+    bool orbitMouseCaptured = false;
+    int orbitStartX = 0;
+    int orbitStartY = 0;
+    float orbitDragX = 0.0f;
+    float orbitDragY = 0.0f;
     auto lastClientSize = window.client_size();
     bool windowWasMinimized = window.is_minimized();
 
@@ -1215,6 +1239,30 @@ int main(int, char**)
         perfHud.push_frametime(deltaSeconds);
         renderer.update_water_time(totalTime);
 
+        if (botPresetBuild
+            && botPresetBuild->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            auto textures = botPresetBuild->get();
+            botPresetBuild.reset();
+            if (pendingBotSpawnCount <= 0)
+            {
+                botManager.clear();
+            }
+            else if (!textures.empty() && botManager.presetsBuilt)
+            {
+                renderer.upload_terrain_texture_layers(
+                    static_cast<std::uint32_t>(botTextureBaseSlot), textures);
+                if (characterSystem.ready())
+                {
+                    npcManager.clear(renderer);
+                    botManager.spawn(pendingBotSpawnCount,
+                        characterSystem.world_x(), characterSystem.world_z(),
+                        character_height_sampler, &heightSamplerCtx);
+                }
+            }
+            pendingBotSpawnCount = 0;
+        }
+
         // Toggle playable mode with P key.
         const auto playToggleDown = window.is_key_down(SDLK_p);
         if (playToggleDown && !playToggleWasDown && characterLoaded)
@@ -1251,13 +1299,51 @@ int main(int, char**)
         }
         playToggleWasDown = playToggleDown;
 
-        if (imguiAvailable)
-            renderer.begin_imgui_frame();
-        const auto imguiWantsKeyboard = imguiAvailable && ImGui::GetIO().WantCaptureKeyboard;
-        const auto imguiWantsMouse = imguiAvailable && ImGui::GetIO().WantCaptureMouse;
+        phoenix::ui::px::begin_frame(window,
+            static_cast<float>(renderer.surface_width()),
+            static_cast<float>(renderer.surface_height()));
+        const auto uiWantsKeyboard = uiAvailable && phoenix::ui::px::wants_keyboard();
+        const auto uiWantsMouse = uiAvailable && phoenix::ui::px::wants_mouse();
 
         const auto [mouseDx, mouseDy] = window.consume_mouse_delta();
         const auto mouseWheel = window.consume_mouse_wheel_delta();
+
+        const bool playableOrbitAvailable = playableMode && characterLoaded && characterSystem.ready();
+        const bool orbitPointerDown = !uiWantsMouse
+            && ((playableOrbitAvailable
+                    && (window.is_mouse_button_down(0) || window.is_mouse_button_down(1)))
+                || (!playableMode && window.is_mouse_button_down(1)));
+        if (orbitPointerDown && !orbitPointerWasDown)
+        {
+            const auto [mouseX, mouseY] = window.mouse_position();
+            orbitStartX = mouseX;
+            orbitStartY = mouseY;
+            orbitDragX = 0.0f;
+            orbitDragY = 0.0f;
+            orbitCapturePending = true;
+        }
+        if (orbitCapturePending && orbitPointerDown)
+        {
+            orbitDragX += static_cast<float>(mouseDx);
+            orbitDragY += static_cast<float>(mouseDy);
+            if (orbitDragX * orbitDragX + orbitDragY * orbitDragY >= 9.0f)
+            {
+                window.set_relative_mouse_mode(true);
+                orbitMouseCaptured = true;
+                orbitCapturePending = false;
+            }
+        }
+        if (!orbitPointerDown && orbitPointerWasDown)
+        {
+            orbitCapturePending = false;
+            if (orbitMouseCaptured)
+            {
+                window.set_relative_mouse_mode(false);
+                window.warp_mouse(orbitStartX, orbitStartY);
+                orbitMouseCaptured = false;
+            }
+        }
+        orbitPointerWasDown = orbitPointerDown;
 
         float cameraX{};
         float cameraY{};
@@ -1269,7 +1355,7 @@ int main(int, char**)
         {
             // ---- Playable mode: third-person character control ----
             phoenix::character::PlayableInput pInput{};
-            if (!imguiWantsKeyboard)
+            if (!uiWantsKeyboard)
             {
                 pInput.forward = window.is_key_down(SDLK_w);
                 pInput.backward = window.is_key_down(SDLK_s);
@@ -1284,12 +1370,13 @@ int main(int, char**)
                 pInput.pitchDown = window.is_key_down(SDLK_DOWN);
                 pInput.sit = window.is_key_down(SDLK_c);
             }
-            pInput.cameraDrag = !imguiWantsMouse && window.is_mouse_button_down(1);
-            pInput.mouseDx = !imguiWantsMouse ? static_cast<float>(mouseDx) : 0.0f;
-            pInput.mouseDy = !imguiWantsMouse ? static_cast<float>(mouseDy) : 0.0f;
-            pInput.mouseWheel = !imguiWantsMouse ? static_cast<float>(mouseWheel) : 0.0f;
+            pInput.cameraOrbit = orbitMouseCaptured;
+            pInput.cameraTurn = orbitMouseCaptured && window.is_mouse_button_down(1);
+            pInput.mouseDx = orbitMouseCaptured ? static_cast<float>(mouseDx) : 0.0f;
+            pInput.mouseDy = orbitMouseCaptured ? static_cast<float>(mouseDy) : 0.0f;
+            pInput.mouseWheel = !uiWantsMouse ? static_cast<float>(mouseWheel) : 0.0f;
 
-            // Apply pending emote from ImGui (set last frame's panel result).
+            // Apply a pending emote set by the previous debug-panel frame.
             pInput.emote = pendingEmote;
             pendingEmote = 0;  // consumed
             pInput.debugAnimation = pendingAnimation;
@@ -1325,7 +1412,7 @@ int main(int, char**)
             }
 
             phoenix::app::update_character_vertices(renderer, characterSystem,
-                characterShadowScratch, displaySettings.characterShadow);
+                characterShadowScratch, graphicsSettings.worldShadows);
             if (!npcManager.active() && botManager.bots.empty())
             {
                 renderer.set_bot_character_visible(false);
@@ -1349,7 +1436,7 @@ int main(int, char**)
         {
             // ---- Viewer mode: free camera ----
             phoenix::runtime::CameraInput cameraInput{};
-            if (!imguiWantsKeyboard)
+            if (!uiWantsKeyboard)
             {
                 cameraInput.forward = window.is_key_down(SDLK_w);
                 cameraInput.backward = window.is_key_down(SDLK_s);
@@ -1363,10 +1450,10 @@ int main(int, char**)
                 cameraInput.pitchUp = window.is_key_down(SDLK_UP);
                 cameraInput.pitchDown = window.is_key_down(SDLK_DOWN);
             }
-            cameraInput.look = !imguiWantsMouse && window.is_mouse_button_down(1);
-            cameraInput.mouseDx = !imguiWantsMouse ? static_cast<float>(mouseDx) : 0.0f;
-            cameraInput.mouseDy = !imguiWantsMouse ? static_cast<float>(mouseDy) : 0.0f;
-            cameraInput.wheel = !imguiWantsMouse ? static_cast<float>(mouseWheel) : 0.0f;
+            cameraInput.look = orbitMouseCaptured;
+            cameraInput.mouseDx = orbitMouseCaptured ? static_cast<float>(mouseDx) : 0.0f;
+            cameraInput.mouseDy = orbitMouseCaptured ? static_cast<float>(mouseDy) : 0.0f;
+            cameraInput.wheel = !uiWantsMouse ? static_cast<float>(mouseWheel) : 0.0f;
 
             const auto cameraChanged = cameraInput.forward || cameraInput.backward
                 || cameraInput.left || cameraInput.right
@@ -1382,44 +1469,6 @@ int main(int, char**)
             renderer.set_character_visible(false);
         }
 
-        // Merge the background bot-effect preload (see botEffectPreloadFuture)
-        // the moment it's done, without ever blocking on it. This is a
-        // one-time, one-shot merge for the whole batch, so it only ever
-        // marks debugEffectTexturesDirty once (see the flush right below)
-        // instead of once per file like the old per-cast lazy path did.
-        if (botEffectPreloadKicked && !botEffectPreloadReady
-            && botEffectPreloadFuture.valid()
-            && botEffectPreloadFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
-        {
-            for (auto& item : botEffectPreloadFuture.get())
-            {
-                const auto key = item.path.string();
-                if (effectLibraryCache.contains(key))
-                    continue;
-
-                DebugEffectLibraryEntry entry{};
-                entry.library = std::move(item.library);
-                entry.meshes = std::move(item.meshes);
-
-                const auto baseLayer = debugEffectTexturesRaw.size();
-                entry.textureLayers.reserve(item.texturePaths.size());
-                for (std::size_t i = 0; i < item.texturePaths.size(); ++i)
-                {
-                    if (item.texturePaths[i].empty())
-                    {
-                        entry.textureLayers.push_back(0xFFFFFFFFu);
-                        debugEffectTexturesRaw.push_back({});
-                        continue;
-                    }
-                    entry.textureLayers.push_back(0x80000000u | static_cast<std::uint32_t>(baseLayer + i));
-                    debugEffectTexturesRaw.push_back(std::move(item.textures[i]));
-                    debugEffectTexturesDirty = true;
-                }
-                effectLibraryCache.emplace(key, std::move(entry));
-            }
-            botEffectPreloadReady = true;
-        }
-
         // Flush any debug-effect textures discovered this frame (bot casts
         // and/or the "Effects" panel's file picker both funnel through
         // ensureEffectLibraryLoaded, which only marks this dirty — see its
@@ -1427,22 +1476,29 @@ int main(int, char**)
         // of how many distinct new files got touched.
         if (debugEffectTexturesDirty)
         {
+            if (debugEffectTexturesRaw.size() != debugEffectTexturePaths.size())
+            {
+                debugEffectTexturesRaw.clear();
+                debugEffectTexturesRaw.resize(debugEffectTexturePaths.size());
+                phoenix::app::parallel_for_loading(cpuLoader, debugEffectTexturePaths.size(), [&](std::size_t i) {
+                    if (!debugEffectTexturePaths[i].empty())
+                        debugEffectTexturesRaw[i] = phoenix::renderer::load_dds(debugEffectTexturePaths[i]);
+                });
+            }
             auto normalized = debugEffectTexturesRaw;
             normalizeTexturesForBcUpload(normalized, {}, 0.0f, 0.0f, 1u);
             renderer.upload_debug_effect_textures(normalized);
+            std::vector<phoenix::renderer::DdsTexture>().swap(debugEffectTexturesRaw);
+            phoenix::app::release_memory_to_os();
             debugEffectTexturesDirty = false;
         }
 
-        // Snap camera position to a fine grid to eliminate sub-pixel jitter
-        // caused by continuous EMA convergence (gravity/terrain smoothing).
-        // Grid = 1/512 world units, below a visible pixel at typical view distances.
-        constexpr float kCameraSnap = 512.0f;
-        const float snappedX = std::round(cameraX * kCameraSnap) / kCameraSnap;
-        const float snappedY = std::round(cameraY * kCameraSnap) / kCameraSnap;
-        const float snappedZ = std::round(cameraZ * kCameraSnap) / kCameraSnap;
-        const float renderCameraX = snappedX;
-        const float renderCameraY = snappedY;
-        const float renderCameraZ = snappedZ;
+        // Godot feeds the continuously smoothed transform to Camera3D.  Preserve
+        // it here as well: quantizing it to a 1/512 grid produced tiny but
+        // perceptible steps while orbiting slowly.
+        const float renderCameraX = cameraX;
+        const float renderCameraY = cameraY;
+        const float renderCameraZ = cameraZ;
         renderer.set_camera(
             renderCameraX,
             renderCameraY,
@@ -1461,6 +1517,50 @@ int main(int, char**)
         currentView.aspect = static_cast<float>(std::max(1u, renderer.surface_width()))
             / static_cast<float>(std::max(1u, renderer.surface_height()));
         currentView.distance = fogCullDistance;
+
+        if (streamedTerrainBuild
+            && streamedTerrainBuild->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            auto terrain = streamedTerrainBuild->get();
+            streamedTerrainBuild.reset();
+            if (!terrain.vertices.empty() && !terrain.indices.empty())
+            {
+                renderer.set_terrain_mesh(terrain.vertices, terrain.indices);
+                terrainVertexCount = static_cast<std::uint32_t>(terrain.vertices.size());
+                terrainIndexCount = static_cast<std::uint32_t>(terrain.indices.size());
+                terrainLodInfo = std::move(terrain.lod);
+                terrainResidencyCenterX = terrain.centerX;
+                terrainResidencyCenterZ = terrain.centerZ;
+                terrainResidencyDistance = terrain.residentDistance;
+                forceVisibilityUpdate = true;
+            }
+        }
+        if (runtime.uses_world_asset_streaming() && !streamedTerrainBuild)
+        {
+            const float dx = currentView.x - terrainResidencyCenterX;
+            const float dz = currentView.z - terrainResidencyCenterZ;
+            const float chunkWidth = std::max(32.0f, terrainLodInfo.cellSize
+                * static_cast<float>(phoenix::runtime::PhoenixRuntime::kTerrainChunkQuads));
+            const float rebuildDistance = std::max(48.0f, chunkWidth * 0.75f);
+            const float wantedDistance = std::max(420.0f, currentView.distance + 192.0f);
+            if (dx * dx + dz * dz >= rebuildDistance * rebuildDistance
+                || std::abs(wantedDistance - terrainResidencyDistance) >= 64.0f)
+            {
+                const float centerX = currentView.x;
+                const float centerZ = currentView.z;
+                streamedTerrainBuild.emplace(cpuLoader.submit(
+                    [&runtime, centerX, centerZ, wantedDistance]() {
+                        StreamedTerrainScene terrain{};
+                        terrain.centerX = centerX;
+                        terrain.centerZ = centerZ;
+                        terrain.residentDistance = wantedDistance;
+                        runtime.build_streamed_terrain_mesh(
+                            terrain.vertices, terrain.indices, terrain.lod,
+                            centerX, centerZ, wantedDistance);
+                        return terrain;
+                    }));
+            }
+        }
 
         // Also update when map (.svmap) NPCs are still waiting to stream in —
         // active() is false until the first one enters range, but update() is
@@ -1481,20 +1581,72 @@ int main(int, char**)
             monsterManager.update(deltaSeconds, monsterView, renderer, &cpuLoader);
         }
 
+        // Models, collision, instances and texture leases use real residency,
+        // with a preload ring and wider unload hysteresis. Model/DDS work and
+        // scene/collision assembly both stay off the render thread.
+        if (streamedSceneBuild
+            && streamedSceneBuild->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            auto scene = streamedSceneBuild->get();
+            streamedSceneBuild.reset();
+            staticObjectScene = std::move(scene.staticObjects);
+            animatedObjectScene = std::move(scene.animatedObjects);
+            worldCollisionMesh = std::move(scene.collision);
+            objectInstanceCount = static_cast<std::uint32_t>(staticObjectScene.instances.size());
+            objectBatchCount = static_cast<std::uint32_t>(staticObjectScene.batches.size());
+            renderer.set_static_object_mesh(
+                staticObjectScene.vertices, staticObjectScene.indices,
+                staticObjectScene.instances, staticObjectScene.batches);
+            renderer.set_animated_object_mesh(
+                animatedObjectScene.vertices, animatedObjectScene.indices,
+                animatedObjectScene.instances, animatedObjectScene.batches);
+
+            std::vector<phoenix::character::CharacterSystem::LadderVolume> ladders;
+            ladders.reserve(scene.ladders.size());
+            for (const auto& ladder : scene.ladders)
+                ladders.push_back({ ladder.x, ladder.z, ladder.baseY,
+                    ladder.topY, ladder.radius });
+            characterSystem.set_ladders(std::move(ladders));
+            std::vector<phoenix::renderer::TerrainVertex>().swap(staticObjectScene.vertices);
+            std::vector<std::uint32_t>().swap(staticObjectScene.indices);
+            forceVisibilityUpdate = true;
+        }
+        if (worldStreamer.active() && !streamedSceneBuild)
+        {
+            const auto streamed = worldStreamer.update(
+                currentView.x, currentView.z, currentView.distance);
+            if (streamed.sceneChanged)
+            {
+                streamedSceneBuild.emplace(cpuLoader.submit([&runtime]() {
+                    StreamedWorldScene scene{};
+                    scene.staticObjects = runtime.build_static_object_scene();
+                    scene.animatedObjects = runtime.build_animated_object_scene();
+                    scene.collision = runtime.build_collision_mesh();
+                    scene.ladders = runtime.ladder_volumes();
+                    return scene;
+                }));
+            }
+        }
+
         const auto cullMoveDx = currentView.x - lastCullView.x;
         const auto cullMoveDy = currentView.y - lastCullView.y;
         const auto cullMoveDz = currentView.z - lastCullView.z;
         const auto cullMoveSq = cullMoveDx * cullMoveDx + cullMoveDy * cullMoveDy + cullMoveDz * cullMoveDz;
+        // Keep CPU-authored visibility close to the camera.  Large refresh
+        // intervals leave an old frustum active while moving or turning and
+        // make world batches appear to blink at the edge of the view.
+        constexpr float kVisibilityMoveRefresh = 8.0f;
+        constexpr float kVisibilityAngleRefresh = 0.02f;
         const bool visibilityNeedsUpdate = forceVisibilityUpdate
-            || cullMoveSq > 96.0f * 96.0f
-            || std::abs(currentView.yaw - lastCullView.yaw) > 0.08f
-            || std::abs(currentView.pitch - lastCullView.pitch) > 0.06f
+            || cullMoveSq > kVisibilityMoveRefresh * kVisibilityMoveRefresh
+            || std::abs(currentView.yaw - lastCullView.yaw) > kVisibilityAngleRefresh
+            || std::abs(currentView.pitch - lastCullView.pitch) > kVisibilityAngleRefresh
             || std::abs(currentView.distance - lastCullView.distance) > 32.0f
             || std::abs(currentView.aspect - lastCullView.aspect) > 0.01f;
         if (visibilityNeedsUpdate)
         {
-            static std::vector<phoenix::renderer::TerrainDrawRange> visibleTerrainRanges;
-            build_visible_terrain_ranges(visibleTerrainRanges, runtime, currentView, terrainLodInfo);
+            build_visible_terrain_ranges(visibleTerrainRanges, runtime, currentView, terrainLodInfo,
+                graphicsSettings.terrainCompatibility);
             renderer.set_terrain_draw_ranges(visibleTerrainRanges);
             std::uint32_t visibleTerrainIndexCount{};
             for (const auto& range : visibleTerrainRanges)
@@ -1502,26 +1654,17 @@ int main(int, char**)
             if (visibleTerrainIndexCount > 0)
                 terrainIndexCount = visibleTerrainIndexCount;
 
-            if (renderer.indirect_draw_ready())
-            {
-                objectBatchCount = static_cast<std::uint32_t>(staticObjectScene.batches.size());
-            }
-            else
-            {
-                static std::vector<phoenix::renderer::ObjectBatch> visibleBatches;
-                visibleBatches.clear();
-                build_visible_object_batches(staticObjectScene, currentView, visibleBatches);
-                renderer.set_static_object_batches(visibleBatches);
-                std::uint32_t visibleObjectInstances{};
-                for (const auto& batch : visibleBatches)
-                    visibleObjectInstances += batch.instanceCount;
-                objectInstanceCount = visibleObjectInstances;
-                objectBatchCount = static_cast<std::uint32_t>(visibleBatches.size());
-            }
+            visibleBatches.clear();
+            build_visible_object_batches(staticObjectScene, currentView, visibleBatches);
+            renderer.set_static_object_batches(visibleBatches);
+            std::uint32_t visibleObjectInstances{};
+            for (const auto& batch : visibleBatches)
+                visibleObjectInstances += batch.instanceCount;
+            objectInstanceCount = visibleObjectInstances;
+            objectBatchCount = static_cast<std::uint32_t>(visibleBatches.size());
 
             if (!animatedObjectScene.batches.empty())
             {
-                static std::vector<phoenix::renderer::ObjectBatch> visibleAnimatedBatches;
                 visibleAnimatedBatches.clear();
                 build_visible_animated_batches(animatedObjectScene, currentView, visibleAnimatedBatches);
                 renderer.set_animated_object_batches(visibleAnimatedBatches);
@@ -1540,7 +1683,7 @@ int main(int, char**)
         if (!animatedObjectScene.vertexAnimations.empty())
         {
             runtime.update_animated_object_scene(animatedObjectScene, totalTime,
-                renderCameraX, renderCameraY, renderCameraZ);
+                renderCameraX, renderCameraY, renderCameraZ, fogCullDistance);
             animatedObjectScene.merge_dirty_ranges();
             for (const auto& range : animatedObjectScene.dirtyVertexRanges)
             {
@@ -1559,12 +1702,15 @@ int main(int, char**)
             const float sinPitch = std::sin(cameraPitch);
             // World-space camera basis, matching the yaw-then-pitch rotation
             // static_object.vert/effect_particle.vert apply to world deltas.
-            const float cameraRightWorld[3]{ cosYaw, 0.0f, -sinYaw };
+            const float cameraRightWorld[3]{ -cosYaw, 0.0f, sinYaw };
             const float cameraUpWorld[3]{ -sinPitch * sinYaw, cosPitch, -sinPitch * cosYaw };
             const float cameraForwardWorld[3]{ cosPitch * sinYaw, sinPitch, cosPitch * cosYaw };
             const float cameraPositionWorld[3]{ renderCameraX, renderCameraY, renderCameraZ };
+            const float effectCullDistance = runtime.state().world.isDungeon
+                ? std::min(fogCullDistance, 20.0f)
+                : std::min(fogCullDistance, 70.0f);
             effectParticleSystem.update(deltaSeconds, cameraPositionWorld,
-                cameraRightWorld, cameraUpWorld, cameraForwardWorld, fogCullDistance);
+                cameraRightWorld, cameraUpWorld, cameraForwardWorld, effectCullDistance);
 
             // WeatherMode -> WeatherParticleSystem kind/intensity. Storm/
             // Snowstorm map to Heavy for now; Light/Medium are already wired
@@ -1579,48 +1725,9 @@ int main(int, char**)
             weatherParticleSystem.update(deltaSeconds, cameraPositionWorld,
                 cameraRightWorld, cameraUpWorld, cameraForwardWorld);
 
-            // WeatherMode -> sun/moon body, brightness and tint. Overcast
-            // skies and storms are fully clouded over, so neither the sun
-            // nor its glow should be visible at all — not even dimmed.
-            // Dusk still gets a warm partial glow, dawn/afternoon a warmer
-            // tint, night swaps to the moon.
-            auto celestialBody = phoenix::runtime::CelestialBody::Sun;
-            float celestialStrength = 1.0f;
-            float celestialTint[3]{ 1.0f, 0.74f, 0.42f };
-            switch (weatherMode)
-            {
-                case WeatherMode::Storm:
-                case WeatherMode::Snowstorm:
-                case WeatherMode::Overcast:
-                    celestialBody = phoenix::runtime::CelestialBody::None;
-                    break;
-                case WeatherMode::Night:
-                    celestialBody = phoenix::runtime::CelestialBody::Moon;
-                    celestialTint[0] = 0.90f; celestialTint[1] = 0.93f; celestialTint[2] = 1.0f;
-                    break;
-                case WeatherMode::Dawn:
-                    celestialTint[0] = 1.0f; celestialTint[1] = 0.58f; celestialTint[2] = 0.32f;
-                    break;
-                case WeatherMode::Dusk:
-                    celestialStrength = 0.72f;
-                    celestialTint[0] = 0.92f; celestialTint[1] = 0.38f; celestialTint[2] = 0.28f;
-                    break;
-                case WeatherMode::MidAfternoon:
-                    celestialTint[0] = 1.0f; celestialTint[1] = 0.82f; celestialTint[2] = 0.52f;
-                    break;
-                default: break; // Default/Sunset: full strength, default warm tint
-            }
-            // Dungeons are indoor/underground — no sky at all (see the
-            // "Dungeons always use pitch-black sky and fog" fog logic
-            // elsewhere), so no sun/moon/stars either regardless of the
-            // selected weather mode.
-            const bool isDungeon = runtime.state().world.isDungeon;
-            if (isDungeon)
-                celestialBody = phoenix::runtime::CelestialBody::None;
-            celestialSystem.update(celestialBody, celestialStrength, celestialTint,
-                cameraPositionWorld, cameraRightWorld, cameraUpWorld, cameraForwardWorld, fogCullDistance);
-            starField.update(!isDungeon && weatherMode == WeatherMode::Night, cameraPositionWorld,
-                cameraRightWorld, cameraUpWorld, cameraForwardWorld, fogCullDistance, totalTime);
+            // Sun/moon discs, their halos and stars live in the sky shader.
+            // This preserves cloud occlusion and prevents the old billboard
+            // systems from drawing a second astro/field.
 
             // Merge every source into the single-upload buffers
             // update_effect_particles() expects — it fully replaces the GPU
@@ -1657,18 +1764,11 @@ int main(int, char**)
             if (weatherParticleSystem.has_particles())
                 append_source(weatherParticleSystem.vertices(), weatherParticleSystem.indices(),
                     weatherParticleSystem.instances(), weatherParticleSystem.batches());
-            if (celestialSystem.has_particles())
-                append_source(celestialSystem.vertices(), celestialSystem.indices(),
-                    celestialSystem.instances(), celestialSystem.batches());
-            if (starField.has_particles())
-                append_source(starField.vertices(), starField.indices(),
-                    starField.instances(), starField.batches());
-
             renderer.update_effect_particles(combinedVertices, combinedIndices, combinedInstances, combinedBatches);
         }
 
 
-        if (imguiAvailable)
+        if (uiAvailable)
         {
             // Lazily load (and cache) whichever data/effects file is currently
             // selected in the debug panel, rebuilding its sequence-name list.
@@ -1685,12 +1785,15 @@ int main(int, char**)
                 for (std::size_t i = 0; i < sequences.size(); ++i)
                 {
                     // .EFT sequence names are stored in an unconverted Korean
-                    // codepage, not UTF-8 — feeding the raw bytes to ImGui
+                    // codepage, not UTF-8 — feeding the raw bytes to the UI
                     // renders as garbage "?" glyphs and isn't guaranteed to be
                     // valid UTF-8 at all. Reduce to printable ASCII only.
                     std::string label = std::to_string(i) + ": ";
-                    for (const unsigned char ch : sequences[i].name)
+                    for (const char raw : sequences[i].name)
+                    {
+                        const auto ch = static_cast<unsigned char>(raw);
                         label += (ch >= 0x20 && ch < 0x7F) ? static_cast<char>(ch) : '.';
+                    }
                     if (label.size() == std::to_string(i).size() + 2)
                         label += "(unnamed)";
                     effectSequenceNames.push_back(std::move(label));
@@ -1699,12 +1802,16 @@ int main(int, char**)
                 loadedEffectFileIndex = selectedEffectFileIndex;
             }
 
-            const bool prevCharacterShadow = displaySettings.characterShadow;
             const auto panelResult = draw_editor_panel(
                 runtime,
                 renderer,
                 fogEnabled,
-                displaySettings.characterShadow,
+                graphicsSettings.worldShadows,
+                graphicsSettings.terrainCompatibility,
+                graphicsSettings.vsyncEnabled,
+                perfHud.fpsCapIndex,
+                perfHud.antialiasingEnabled,
+                perfHud.antialiasingAvailable,
                 playMapSounds,
                 playMapMusic,
                 masterVolume,
@@ -1734,12 +1841,7 @@ int main(int, char**)
                 effectParticleSystem.debug_effect_count(),
                 effectSpawnYOffset,
                 effectComponentIndex,
-                assetsFullyLoaded.load());
-
-            // The shadow toggle changes the character mesh topology (extra
-            // flattened range), so rebuild the GPU buffers on change.
-            if (prevCharacterShadow != displaySettings.characterShadow)
-                uploadCharacterMesh();
+                /*assetsReady=*/true);
 
             if (panelResult.loadRequested)
                 pendingMapLoad = static_cast<std::size_t>(std::max(0, selectedMapIndex));
@@ -1752,6 +1854,8 @@ int main(int, char**)
             {
                 applyFogSettings();
             }
+            if (panelResult.terrainCompatibilityChanged)
+                forceVisibilityUpdate = true;
 
             if (panelResult.characterChanged)
                 reloadCharacterIntoRenderer();
@@ -1761,13 +1865,65 @@ int main(int, char**)
                 pendingAnimation = panelResult.animationTriggered;
             if (panelResult.botSpawnCount > 0 && playableMode && characterLoaded && characterSystem.ready())
             {
-                npcManager.clear(renderer);
-                botManager.spawn(panelResult.botSpawnCount, characterSystem.world_x(), characterSystem.world_z(),
-                    character_height_sampler, &heightSamplerCtx);
+                if (botManager.presetsBuilt)
+                {
+                    npcManager.clear(renderer);
+                    botManager.spawn(panelResult.botSpawnCount,
+                        characterSystem.world_x(), characterSystem.world_z(),
+                        character_height_sampler, &heightSamplerCtx);
+                }
+                else
+                {
+                    pendingBotSpawnCount += panelResult.botSpawnCount;
+                    if (!botPresetBuild)
+                    {
+                        const auto firstSlot = static_cast<std::uint32_t>(botTextureBaseSlot);
+                        const auto textureWidth = renderer.terrain_texture_width();
+                        const auto textureHeight = renderer.terrain_texture_height();
+                        const auto textureMips = renderer.terrain_texture_mip_levels();
+                        botPresetBuild.emplace(cpuLoader.submit(
+                            [&botManager, &runtime, &characterOptions, &botEquipmentPools,
+                                firstSlot, textureWidth, textureHeight, textureMips]() {
+                                std::vector<phoenix::renderer::DdsTexture> slots(
+                                    static_cast<std::size_t>(firstSlot) + kBotTextureSlotReserve);
+                                if (!botManager.build_random_presets(
+                                    runtime.state().assets.root,
+                                    characterOptions,
+                                    botEquipmentPools,
+                                    firstSlot,
+                                    kBotTextureSlotReserve,
+                                    slots,
+                                    /*allowPreload=*/false))
+                                    return std::vector<phoenix::renderer::DdsTexture>{};
+
+                                std::vector<phoenix::renderer::DdsTexture> textures(kBotTextureSlotReserve);
+                                for (std::size_t i = 0; i < textures.size(); ++i)
+                                {
+                                    textures[i] = std::move(slots[static_cast<std::size_t>(firstSlot) + i]);
+                                    auto& texture = textures[i];
+                                    if (!texture.valid || textureWidth == 0
+                                        || textureHeight == 0 || textureMips == 0)
+                                        continue;
+                                    const bool canonical = texture.compressed
+                                        && texture.vkFormat == phoenix::renderer::kDdsFormatBc3UnormBlock
+                                        && texture.width == textureWidth
+                                        && texture.height == textureHeight
+                                        && texture.mipData.size() >= textureMips;
+                                    if (!canonical)
+                                        phoenix::renderer::convert_texture_to_bc3(
+                                            texture, textureWidth, textureHeight, textureMips);
+                                }
+                                return textures;
+                            }));
+                    }
+                }
             }
             if (panelResult.clearBots)
             {
-                botManager.clear_bots();
+                pendingBotSpawnCount = 0;
+                if (!botPresetBuild)
+                    botManager.clear();
+                renderer.set_bot_character_visible(false);
                 reloadCharacterIntoRenderer();
                 phoenix::app::release_memory_to_os();
             }
@@ -1970,14 +2126,13 @@ int main(int, char**)
             }
         }
 
-        // In-world labels: NPC name (yellow) over type (light blue/celeste), and
-        // monster name (yellow, no type). Small Arial, black outline, anchored
-        // just above each visible head, occluded by world geometry.
-        if (imguiAvailable && (npcManager.active() || monsterManager.active()))
+        // In-world labels are authored by the game and rendered by the engine's
+        // native text pass; the debug UI uses the same tiny atlas renderer.
+        std::vector<phoenix::renderer::ScreenLabel> worldLabels;
+        if (npcManager.active() || monsterManager.active())
         {
             const float w = static_cast<float>(std::max(1u, renderer.surface_width()));
             const float h = static_cast<float>(std::max(1u, renderer.surface_height()));
-            ImFont* labelFont = renderer.npc_label_font();
             constexpr float labelFontSize = 14.0f;
             // Fixed screen gap between the NPC's head and the label: keeping this in
             // pixels (not world units) makes the label sit at a consistent spot
@@ -1986,26 +2141,15 @@ int main(int, char**)
             // Names show closer than the NPC render cull to avoid distant clutter.
             constexpr float labelMaxDistance = 50.0f;
             const float labelMaxDistSq = labelMaxDistance * labelMaxDistance;
-            auto* drawList = ImGui::GetForegroundDrawList();
-            const ImU32 outlineCol = IM_COL32(0, 0, 0, 235);
-            const ImU32 nameCol = IM_COL32(255, 226, 0, 255);    // yellow
-            const ImU32 typeCol = IM_COL32(90, 200, 255, 255);   // celeste
-            const auto drawCentered = [&](float cx, float top, const char* text, ImU32 col) {
-                const ImVec2 ts = labelFont
-                    ? labelFont->CalcTextSizeA(labelFontSize, 1e30f, 0.0f, text)
-                    : ImGui::CalcTextSize(text);
-                const float x = cx - ts.x * 0.5f;
-                // Thin 4-way (cardinal) outline rather than a full 8-way ring.
-                static constexpr int kOutline[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
-                for (const auto& o : kOutline)
-                {
-                    const ImVec2 op(x + static_cast<float>(o[0]), top + static_cast<float>(o[1]));
-                    if (labelFont) drawList->AddText(labelFont, labelFontSize, op, outlineCol, text);
-                    else drawList->AddText(op, outlineCol, text);
-                }
-                const ImVec2 p(x, top);
-                if (labelFont) drawList->AddText(labelFont, labelFontSize, p, col, text);
-                else drawList->AddText(p, col, text);
+            constexpr std::uint8_t nameCol[4]{ 255, 226, 0, 255 };
+            constexpr std::uint8_t typeCol[4]{ 90, 200, 255, 255 };
+            const auto drawCentered = [&](float cx, float top, const char* text, const std::uint8_t (&color)[4]) {
+                phoenix::renderer::ScreenLabel output{};
+                output.centerX = cx;
+                output.topY = top;
+                output.text = text;
+                std::copy(std::begin(color), std::end(color), std::begin(output.color));
+                worldLabels.push_back(std::move(output));
             };
             // Case-insensitive match for the generic types whose label is hidden.
             const auto iequals = [](const std::string& a, const char* b) {
@@ -2059,10 +2203,31 @@ int main(int, char**)
                 phoenix::renderer::ScreenPoint sp{};
                 if (!project_world_to_screen(currentView, label.x, label.y, label.z, w, h, sp))
                     continue;
+                phoenix::renderer::ScreenPoint feet{};
+                if (!project_world_to_screen(currentView, label.x, label.baseY, label.z, w, h, feet))
+                    continue;
+
+                // Mobs expose their name only while the pointer is over the
+                // projected creature, matching the Godot client and avoiding a
+                // permanent field of labels. Derive the hit area from the actual
+                // head/feet projection so it remains stable at every distance.
+                const auto [mouseX, mouseY] = window.mouse_position();
+                const float bodyHeight = std::clamp(std::abs(feet.y - sp.y), 10.0f, 180.0f);
+                const float halfWidth = std::clamp(bodyHeight * 0.34f, 7.0f, 55.0f);
+                const float top = std::min(sp.y, feet.y) - 4.0f;
+                const float bottom = std::max(sp.y, feet.y) + 5.0f;
+                const bool hovered = !uiWantsMouse
+                    && static_cast<float>(mouseX) >= sp.x - halfWidth && static_cast<float>(mouseX) <= sp.x + halfWidth
+                    && static_cast<float>(mouseY) >= top && static_cast<float>(mouseY) <= bottom;
+                if (!hovered)
+                    continue;
                 if (label.name && !label.name->empty())
                     drawCentered(sp.x, sp.y - labelPixelGap - labelFontSize, label.name->c_str(), nameCol);
             }
         }
+
+        renderer.set_world_labels(std::move(worldLabels));
+        renderer.set_screen_ui(phoenix::ui::px::end_frame());
 
         renderer.render_frame();
 
@@ -2075,37 +2240,64 @@ int main(int, char**)
                     ;
             }
         }
-
-
-
         if (pendingMapLoad)
         {
             const auto mapIdx = *pendingMapLoad;
             pendingMapLoad.reset();
+
+            // Put a finished loading frame on screen before releasing the old
+            // world. No further old-world draw is submitted after this point.
+            renderer.enter_loading_mode();
+            renderer.set_world_labels({});
+            renderer.set_screen_ui({});
+            showLoading(0.02f, "Changing map");
+            audioSystem.stop_all();
+            if (botPresetBuild)
+            {
+                botPresetBuild->wait();
+                botPresetBuild.reset();
+            }
+            pendingBotSpawnCount = 0;
             botManager.clear();
             npcManager.clear(renderer);
             monsterManager.clear(renderer);
 
-            // Release previous map data BEFORE loading the new one to avoid
-            // both maps coexisting in RAM (doubles peak memory).
+            // Release the old map before decoding the replacement. This keeps
+            // maps from overlapping in CPU/GPU memory and covers resource
+            // kinds which the next map does not use at all.
+            effectParticleSystem.release_map_resources();
+            weatherParticleSystem.release_map_resources();
+            std::vector<PendingBotEffect>().swap(pendingBotEffects);
+            characterSystem.set_ladders({});
+            mapAudioScene = {};
+            staticObjectScene = {};
+            animatedObjectScene = {};
+            worldCollisionMesh = {};
+            terrainLodInfo = {};
+            std::vector<phoenix::renderer::TerrainDrawRange>().swap(visibleTerrainRanges);
+            std::vector<phoenix::renderer::ObjectBatch>().swap(visibleBatches);
+            std::vector<phoenix::renderer::ObjectBatch>().swap(visibleAnimatedBatches);
+            lastCullView = {};
+            terrainTexturesUploaded = false;
+            terrainVertexCount = 0;
+            terrainIndexCount = 0;
+            objectInstanceCount = 0;
+            objectBatchCount = 0;
+            if (streamedSceneBuild)
             {
-                staticObjectScene.instances.clear(); staticObjectScene.instances.shrink_to_fit();
-                staticObjectScene.batches.clear(); staticObjectScene.batches.shrink_to_fit();
-                staticObjectScene.batchBounds.clear(); staticObjectScene.batchBounds.shrink_to_fit();
-                animatedObjectScene.vertices.clear(); animatedObjectScene.vertices.shrink_to_fit();
-                animatedObjectScene.indices.clear(); animatedObjectScene.indices.shrink_to_fit();
-                animatedObjectScene.baseInstances.clear(); animatedObjectScene.baseInstances.shrink_to_fit();
-                animatedObjectScene.instances.clear(); animatedObjectScene.instances.shrink_to_fit();
-                animatedObjectScene.batches.clear(); animatedObjectScene.batches.shrink_to_fit();
-                animatedObjectScene.vertexAnimations.clear(); animatedObjectScene.vertexAnimations.shrink_to_fit();
-                worldCollisionMesh.triangles.clear(); worldCollisionMesh.triangles.shrink_to_fit();
-                worldCollisionMesh.grid.clear();
+                streamedSceneBuild->wait();
+                streamedSceneBuild.reset();
             }
+            if (streamedTerrainBuild)
+            {
+                streamedTerrainBuild->wait();
+                streamedTerrainBuild.reset();
+            }
+            worldStreamer.reset();
+            runtime.release_world_map_resources();
+            renderer.release_world_resources();
+            phoenix::app::release_memory_to_os();
 
-            renderer.enter_loading_mode();
-            // Kill every sound from the previous map immediately — music,
-            // ambient emitters and in-flight one-shots must not bleed over.
-            audioSystem.stop_all();
             showLoading(0.05f, "Changing map");
             if (runAsync([&]() { return runtime.load_world_map(mapIdx); }, 0.10f, "Loading world"))
             {

@@ -1,7 +1,5 @@
 #include "platform/sdl_window.h"
 
-#include "imgui_impl_sdl2.h"
-
 namespace phoenix::platform
 {
     SdlWindow::~SdlWindow()
@@ -73,25 +71,19 @@ namespace phoenix::platform
         // 4.3 (still covers compute shaders) before giving up entirely.
         SDL_GL_MakeCurrent(window_, glContext_);
 
-        // The Vulkan renderer preferred VK_PRESENT_MODE_MAILBOX_KHR (present
-        // without blocking the loop on the display's refresh) and only fell
-        // back to FIFO (vsync-blocking) when mailbox wasn't available. Mirror
-        // that by leaving swap interval off here too: the render loop's own
-        // FPS Cap combo (perf_hud.cpp, up to 360) already paces frames via a
-        // sleep after render_frame(), same as the original design. Forcing
-        // SwapInterval(1) would block every SwapWindow() on vsync and cap
-        // everything at the monitor's refresh rate regardless of that combo.
+        // Start unsynchronised only until phoenix.ini is loaded. The persisted
+        // Graphics/VSync setting is applied by main immediately after renderer
+        // initialisation, and is enabled by default.
         SDL_GL_SetSwapInterval(0);
         return true;
     }
 
     bool SdlWindow::pump_messages()
     {
+        mouseButtonsPressed_.fill(false);
         SDL_Event event{};
         while (SDL_PollEvent(&event))
         {
-            ImGui_ImplSDL2_ProcessEvent(&event);
-
             switch (event.type)
             {
             case SDL_QUIT:
@@ -143,10 +135,15 @@ namespace phoenix::platform
                 break;
 
             case SDL_MOUSEMOTION:
-                if (hasMousePosition_)
+                if (relativeMouseMode_)
                 {
-                    mouseDeltaX_ += event.motion.x - lastMouseX_;
-                    mouseDeltaY_ += event.motion.y - lastMouseY_;
+                    mouseDeltaX_ += event.motion.xrel;
+                    mouseDeltaY_ += event.motion.yrel;
+                }
+                else if (hasMousePosition_)
+                {
+                    mouseDeltaX_ += event.motion.xrel;
+                    mouseDeltaY_ += event.motion.yrel;
                 }
                 lastMouseX_ = event.motion.x;
                 lastMouseY_ = event.motion.y;
@@ -154,9 +151,9 @@ namespace phoenix::platform
                 break;
 
             case SDL_MOUSEBUTTONDOWN:
-                if (event.button.button == SDL_BUTTON_LEFT)   mouseButtons_[0] = true;
-                if (event.button.button == SDL_BUTTON_RIGHT)  mouseButtons_[1] = true;
-                if (event.button.button == SDL_BUTTON_MIDDLE) mouseButtons_[2] = true;
+                if (event.button.button == SDL_BUTTON_LEFT)   mouseButtons_[0] = mouseButtonsPressed_[0] = true;
+                if (event.button.button == SDL_BUTTON_RIGHT)  mouseButtons_[1] = mouseButtonsPressed_[1] = true;
+                if (event.button.button == SDL_BUTTON_MIDDLE) mouseButtons_[2] = mouseButtonsPressed_[2] = true;
                 break;
 
             case SDL_MOUSEBUTTONUP:
@@ -218,6 +215,38 @@ namespace phoenix::platform
     std::pair<int, int> SdlWindow::mouse_position() const
     {
         return { lastMouseX_, lastMouseY_ };
+    }
+
+    bool SdlWindow::mouse_button_pressed(int button) const
+    {
+        if (button < 0 || button >= static_cast<int>(mouseButtonsPressed_.size()))
+            return false;
+        return mouseButtonsPressed_[static_cast<std::size_t>(button)];
+    }
+
+    void SdlWindow::set_relative_mouse_mode(bool enabled)
+    {
+        if (!window_ || relativeMouseMode_ == enabled)
+            return;
+        if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) == 0)
+        {
+            relativeMouseMode_ = enabled;
+            mouseDeltaX_ = 0;
+            mouseDeltaY_ = 0;
+            hasMousePosition_ = false;
+        }
+    }
+
+    void SdlWindow::warp_mouse(int x, int y)
+    {
+        if (!window_)
+            return;
+        SDL_WarpMouseInWindow(window_, x, y);
+        lastMouseX_ = x;
+        lastMouseY_ = y;
+        hasMousePosition_ = true;
+        mouseDeltaX_ = 0;
+        mouseDeltaY_ = 0;
     }
 
     std::pair<int, int> SdlWindow::client_size() const

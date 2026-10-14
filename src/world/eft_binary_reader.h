@@ -21,6 +21,11 @@ namespace phoenix::world::detail
         std::size_t offset{};
         bool ok{ true };
 
+        explicit EftReader(const std::vector<std::uint8_t>& source)
+            : data(source)
+        {
+        }
+
         std::uint32_t u32()
         {
             if (!ok || offset + 4 > data.size())
@@ -129,6 +134,24 @@ namespace phoenix::world::detail
         {
             const auto value = u32();
             if (!ok || value > maximum)
+            {
+                ok = false;
+                return 0;
+            }
+            return value;
+        }
+
+        // Validate a list against the bytes actually left in the file rather
+        // than an authoring-era index ceiling. The individual record readers
+        // continue to validate every field and reject truncated data.
+        std::uint32_t count_for_remaining(std::size_t minimumBytesPerItem,
+            std::uint32_t safetyMaximum = 1000000)
+        {
+            const auto value = u32();
+            const auto bytesLeft = offset <= data.size() ? data.size() - offset : 0;
+            const auto byteBound = minimumBytesPerItem > 0
+                ? bytesLeft / minimumBytesPerItem : bytesLeft;
+            if (!ok || value > safetyMaximum || static_cast<std::size_t>(value) > byteBound)
             {
                 ok = false;
                 return 0;

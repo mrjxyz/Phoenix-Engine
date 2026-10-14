@@ -1,4 +1,5 @@
 #include "character/monster_manager.h"
+#include "world/coordinate_conversion.h"
 
 #include "app/loading_scheduler.h"
 #include "assets/data_index.h"
@@ -21,11 +22,11 @@ namespace phoenix::character
     namespace
     {
         constexpr float kMonsterBaseScale = 0.95f;
-        // Animation-LOD distance tiers (squared, world units): near -> 60/s pose
-        // rate; mid -> 30/s; far -> 15/s. Coarser rates let distant mobs share a
-        // skinning job (imperceptible at distance).
-        constexpr float kAnimLodNearSq = 25.0f * 25.0f;
-        constexpr float kAnimLodMidSq = 55.0f * 55.0f;
+        // Aggressive default animation LOD: preserve full motion around combat,
+        // then quantize distant poses early so many mobs share one skinning job.
+        // This mirrors Compatibility's entity profile without changing topology.
+        constexpr float kAnimLodNearSq = 15.0f * 15.0f;
+        constexpr float kAnimLodMidSq = 35.0f * 35.0f;
         constexpr float kAniFramesPerSecond = 30.0f;
         constexpr float kAnimationBlendDuration = 0.12f;
         constexpr float kOneShotBlendDuration = 0.25f;
@@ -236,32 +237,6 @@ namespace phoenix::character
             return { m.m[3][0], m.m[3][1], m.m[3][2] };
         }
 
-        Vec3 transform_point(const Mat4& m, Vec3 v)
-        {
-            return {
-                m.m[0][0] * v.x + m.m[1][0] * v.y + m.m[2][0] * v.z + m.m[3][0],
-                m.m[0][1] * v.x + m.m[1][1] * v.y + m.m[2][1] * v.z + m.m[3][1],
-                m.m[0][2] * v.x + m.m[1][2] * v.y + m.m[2][2] * v.z + m.m[3][2],
-            };
-        }
-
-        Vec3 transform_normal(const Mat4& m, Vec3 v)
-        {
-            return {
-                m.m[0][0] * v.x + m.m[1][0] * v.y + m.m[2][0] * v.z,
-                m.m[0][1] * v.x + m.m[1][1] * v.y + m.m[2][1] * v.z,
-                m.m[0][2] * v.x + m.m[1][2] * v.y + m.m[2][2] * v.z,
-            };
-        }
-
-        Vec3 normalize_vec3(Vec3 v)
-        {
-            const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-            if (len <= 0.0001f)
-                return {};
-            return { v.x / len, v.y / len, v.z / len };
-        }
-
         Quat sample_rotation(const world::CharacterAnimationBone& bone, float frame)
         {
             if (bone.rotationFrames.empty())
@@ -452,6 +427,25 @@ namespace phoenix::character
         }
 
         {
+            // A compact canonical catalog can override display names without
+            // replacing the extracted model/size rows. Phoenix-Godot exports
+            // this as monster/catalog.txt using the stable monster ID.
+            std::unordered_map<std::uint32_t, std::string> canonicalNames;
+            if (auto names = phoenix::assets::open_ifstream(root / "catalog.txt"))
+            {
+                std::string line;
+                std::getline(names, line);
+                while (std::getline(names, line))
+                {
+                    if (line.empty())
+                        continue;
+                    const auto row = split_csv_line(line);
+                    if (row.size() < 2 || row[1].empty())
+                        continue;
+                    canonicalNames.insert_or_assign(parse_u32(row[0]), row[1]);
+                }
+            }
+
             auto file = phoenix::assets::open_ifstream(root / "monsterdata.csv");
             if (!file)
             {
@@ -470,7 +464,8 @@ namespace phoenix::character
                 MonsterCatalogEntry entry{};
                 entry.catalogIndex = catalog_.size();
                 entry.monsterId = parse_u32(row[0]);
-                entry.name = row[1];
+                const auto canonical = canonicalNames.find(entry.monsterId);
+                entry.name = canonical != canonicalNames.end() ? canonical->second : row[1];
                 entry.modelIndex = parse_u32(row[2]);
                 entry.size = parse_u32(row[3]);
                 entry.label = entry.name + "  [id " + std::to_string(entry.monsterId)
@@ -542,13 +537,20 @@ namespace phoenix::character
 
     void MonsterManager::clear(phoenix::renderer::OpenGLRenderer& renderer)
     {
+        for (auto& [_, load] : visualLoads_)
+            if (load.valid()) load.wait();
+        visualLoads_.clear();
+        visualLoads_.rehash(0);
+
         placements_.clear();
         placements_.shrink_to_fit();
         streamedPlacements_ = 0;
-        visualLoads_.clear();
-        failedModels_.clear();
         active_.clear();
         active_.shrink_to_fit();
+        visuals_.clear();
+        visuals_.rehash(0);
+        failedModels_.clear();
+        failedModels_.rehash(0);
         labels_.clear();
         labels_.shrink_to_fit();
         renderVertices_.clear();
@@ -559,6 +561,25 @@ namespace phoenix::character
         instances_.shrink_to_fit();
         instanceBatches_.clear();
         instanceBatches_.shrink_to_fit();
+        paletteFloats_.clear();
+        paletteFloats_.shrink_to_fit();
+        modelIndexOffset_.clear();
+        modelIndexOffset_.rehash(0);
+        textureSlotByPath_.clear();
+        textureSlotByPath_.rehash(0);
+        slotRefcount_.clear();
+        slotRefcount_.rehash(0);
+        textureKeyBySlot_.clear();
+        textureKeyBySlot_.rehash(0);
+        freeTextureSlots_.clear();
+        freeTextureSlots_.shrink_to_fit();
+        modelLastUsedFrame_.clear();
+        modelLastUsedFrame_.rehash(0);
+        mapDataRoot_.clear();
+        mapTextureBaseSlot_ = 0;
+        mapTextureReserve_ = 0;
+        nextTextureSlot_ = 0;
+        frameCounter_ = 0;
         visibleCount_ = 0;
         renderer.update_monster_character_instances(instances_, instanceBatches_);
         renderer.set_monster_character_visible(false);
@@ -739,6 +760,9 @@ namespace phoenix::character
         VisualLoadPlan plan;
         if (!plan_visual(dataRoot, entry, textureBaseSlot, textureSlotReserve, plan))
             return nullptr;
+        plan.targetTextureWidth = renderer.terrain_texture_width();
+        plan.targetTextureHeight = renderer.terrain_texture_height();
+        plan.targetTextureMipLevels = renderer.terrain_texture_mip_levels();
         auto parsed = parse_visual(plan);
         if (!parsed)
         {
@@ -776,8 +800,22 @@ namespace phoenix::character
             const std::uint32_t textureSlot = part.textureSlot;
             const bool alphaCutout = phoenix::renderer::dds_file_has_alpha_cutout(part.texturePath);
             if (part.decodeTexture)
-                next.pendingTextureUploads.push_back(
-                    { textureSlot, phoenix::renderer::load_dds(part.texturePath) });
+            {
+                auto texture = phoenix::renderer::load_dds(part.texturePath);
+                const bool canonical = texture.valid && texture.compressed
+                    && texture.vkFormat == phoenix::renderer::kDdsFormatBc3UnormBlock
+                    && texture.width == plan.targetTextureWidth
+                    && texture.height == plan.targetTextureHeight
+                    && texture.mipData.size() >= plan.targetTextureMipLevels;
+                if (!canonical && plan.targetTextureWidth > 0
+                    && plan.targetTextureHeight > 0 && plan.targetTextureMipLevels > 0)
+                {
+                    phoenix::renderer::convert_texture_to_bc3(texture,
+                        plan.targetTextureWidth, plan.targetTextureHeight,
+                        plan.targetTextureMipLevels);
+                }
+                next.pendingTextureUploads.push_back({ textureSlot, std::move(texture) });
+            }
             next.textureSlots.push_back(textureSlot);
 
             const auto baseVertex = static_cast<std::uint32_t>(next.skinnedBind.size());
@@ -976,6 +1014,8 @@ namespace phoenix::character
         std::uint32_t textureSlotReserve,
         phoenix::renderer::OpenGLRenderer& renderer)
     {
+        for (auto& [_, load] : visualLoads_)
+            if (load.valid()) load.wait();
         placements_.clear();
         streamedPlacements_ = 0;
         mapDataRoot_ = dataRoot;
@@ -1018,10 +1058,11 @@ namespace phoenix::character
         {
             // Raw map-space box -> engine/world space (matches WLD instances). The
             // box floor (min Y) is the spawn height; mobs keep it as they wander.
-            const float minX = std::min(area.minX, area.maxX) - halfMap;
-            const float maxX = std::max(area.minX, area.maxX) - halfMap;
-            const float minZ = std::min(area.minZ, area.maxZ) - halfMap;
-            const float maxZ = std::max(area.minZ, area.maxZ) - halfMap;
+            float minX = area.minX;
+            float maxX = area.maxX;
+            phoenix::world::mirror_source_box_x(minX, maxX, halfMap);
+            const float minZ = phoenix::world::source_to_world_z(std::min(area.minZ, area.maxZ), halfMap);
+            const float maxZ = phoenix::world::source_to_world_z(std::max(area.minZ, area.maxZ), halfMap);
             const float groundY = std::min(area.minY, area.maxY);
             for (const auto& mob : area.mobs)
             {
@@ -1098,6 +1139,9 @@ namespace phoenix::character
                         ++streamedPlacements_;
                         continue;
                     }
+                    plan.targetTextureWidth = renderer.terrain_texture_width();
+                    plan.targetTextureHeight = renderer.terrain_texture_height();
+                    plan.targetTextureMipLevels = renderer.terrain_texture_mip_levels();
                     if (workerPool)
                     {
                         visualLoads_.emplace(model,
@@ -1557,7 +1601,7 @@ namespace phoenix::character
         poseKeys.clear();
         // Visible entities with their built instance, kept per-entity so they can
         // be grouped by model into contiguous instanced draws below.
-        struct VisInst { std::uint32_t model; phoenix::renderer::ObjectInstance inst; };
+        struct VisInst { std::uint32_t model{}; phoenix::renderer::ObjectInstance inst; };
         static std::vector<VisInst> vis;
         vis.clear();
         // Pass 1 (serial): cull, advance animation, dedup poses; the heavy bone
@@ -1592,7 +1636,8 @@ namespace phoenix::character
             {
                 const auto& entry = catalog_[monster.catalogIndex];
                 labels_.push_back({ monster.x,
-                    monster.y + visual.modelTopY * monster.scale, monster.z, &entry.name });
+                    monster.y + visual.modelTopY * monster.scale, monster.z,
+                    monster.y, &entry.name });
             }
 
             // Palette dedup: reuse an identical pose's palette base; otherwise
@@ -1610,7 +1655,7 @@ namespace phoenix::character
                 const float dx = monster.x - view.x, dy = monster.y - view.y, dz = monster.z - view.z;
                 const float d2 = dx * dx + dy * dy + dz * dz;
                 const float rate = d2 < kAnimLodNearSq ? 60.0f
-                    : (d2 < kAnimLodMidSq ? 30.0f : 15.0f);
+                    : (d2 < kAnimLodMidSq ? 20.0f : 10.0f);
                 tier = d2 < kAnimLodNearSq ? 0 : (d2 < kAnimLodMidSq ? 1 : 2);
                 bucket = static_cast<std::int32_t>(std::lround(monster.animationSeconds * rate));
                 for (const auto& k : poseKeys)

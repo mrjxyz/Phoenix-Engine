@@ -1,17 +1,71 @@
 # Changelog
 
-All notable changes to Phoenix Engine are documented here. Dates are ISO-8601.
+All notable changes to Phoenix Client are documented here. Dates are ISO-8601.
 
-## [Unreleased]
+## [v1.0.0] - 2026-09-01
+
+Phoenix Client v1.0 is the stable and final release. It completes the project's
+defined role as a reusable MMO client foundation and gameplay-preview runtime;
+no further feature updates are planned.
+
+### Added
+- **Native Phoenix UI.** The debug panel, performance HUD, controls reference,
+  and graphics controls now render through the client's own lightweight
+  screen-space UI. Graphics settings include persistent VSync, anti-aliasing,
+  FPS cap, world shadows, and render/fog distances through `phoenix.ini`.
+- **Native world labels and canonical entity names.** NPC and monster names no
+  longer depend on a debug UI backend; monster names appear on hover and use
+  the matching names imported from the canonical game data when available.
+
+### Changed
+- **Godot presentation parity.** World handedness, playable-character
+  orientation and controls, camera behavior/collision, environment lighting,
+  shadows, sky, water, cloak simulation, default equipment, and map-effect
+  composition/timing now follow the established Phoenix Godot client as
+  closely as the C++ renderer permits.
+- **Aggressive world LOD is now the default.** Terrain detail is preserved,
+  while static world objects and actors use distance-aware batching and LOD.
+  Fog distance consistently controls world-asset visibility, and asset/effect
+  selectors no longer have fixed index ceilings.
+- **World texture sampling matches the canonical client more closely.** Static
+  assets use stable trilinear filtering and regenerated mip chains derived
+  from their base texture level to reduce movement shimmer.
+- **Texture fallback support is explicit.** Canonical BC3 DDS data still takes
+  the fast path; PNG, BMP, TGA, BC1/BC2, and uncompressed inputs are accepted
+  and normalised when needed.
+
+### Fixed
+- Camera penetration into terrain, reversed lateral movement/dodge input, and
+  inconsistent character/cloak lighting.
+- Map-effect sequence composition and timing differences from the canonical
+  client.
+- A missing or unreadable binary asset can no longer turn a failed stream
+  length (`tellg() == -1`) into a huge allocation and terminate the runtime.
+- Negative bot spawn counts are rejected instead of converting to an enormous
+  unsigned reservation.
+- Loader bounds, image-size arithmetic, signed effect-name sanitisation, and
+  partial OpenGL buffer update checks are now overflow-safe.
+
+### Removed
+- Dear ImGui, its SDL/OpenGL backends, icon resources, settings integration,
+  and build dependency after the native UI replacement became functional.
+- Obsolete sky presets and the unused aurora shader path.
+- Unreachable legacy terrain/object rendering code and the permanently
+  disabled compute-culling scaffolding.
+
+### Documentation
+- Renamed the project from Phoenix Engine to Phoenix Client and updated the
+  application, build targets, scripts, paths, technical guides, and license.
+- Defined the project's final scope explicitly: it is a client foundation, not
+  a complete game, server, or turnkey MMO product.
+
+## [v0.10] - 2026-07-19
 
 ### Changed
 - **Perf HUD icons moved from hardcoded arrays to PNG files.** The Windows/
   Linux/Nvidia/AMD/Intel icons in `src/ui/perf_hud_icons.h` (raw RGBA byte
-  arrays baked into the source) are now loose `res/icons/*.png` files loaded
-  through the new `png_loader`, resolved with the same repo-root/build-dir
-  candidate search already used for shaders. Verified byte-for-byte identical
-  to the original embedded pixel data before switching over;
-  `perf_hud_icons.h` is deleted.
+  arrays baked into the source) became loose `res/icons/*.png` resources
+  loaded through the new PNG loader. The generated header was removed.
 
 ### Added
 - **PNG loading via stb_image.** Vendored `external/stb_image.h` (same
@@ -20,8 +74,7 @@ All notable changes to Phoenix Engine are documented here. Dates are ISO-8601.
   `read_file_binary`/case-insensitive path resolution instead of stb's own
   `fopen` path, for consistency with every other asset loader. New
   `src/renderer/png_loader.{h,cpp}` (`PngImage load_png(path)`) decodes to
-  8-bit RGBA, ready to feed into `upload_imgui_icon_rgba` — this is the
-  intended path for future UI/interface icon art.
+  8-bit RGBA for UI texture uploads.
 
 ### Performance
 - **CPU skinning: skin matrices hoisted out of the per-vertex loop.**
@@ -144,15 +197,6 @@ All notable changes to Phoenix Engine are documented here. Dates are ISO-8601.
   now skips any `.smod`/`.dg` sub-mesh with an empty texture name entirely,
   matching how the original client treats them.
 
-### Removed
-- **`dds_normalize` moved out of this repo.** It's a one-shot data-prep tool,
-  not engine code, so mixing it into the engine's source tree/build didn't
-  make sense. Moved to its own standalone project (`tools/dds_normalize.cpp`,
-  `src/renderer/dds_loader.*`, `src/assets/data_index.*` copies + its own
-  `CMakeLists.txt`) outside this repo; removed the `dds_normalize` CMake
-  target and the `tools/` directory from here entirely. Usage docs in
-  README.md/`docs/ASSETS.md` now just reference the standalone tool by name.
-
 ### Changed
 - **Settings consolidated into imgui.ini.** `display.ini` (character shadow
   toggle) and `perf_hud.ini` (FPS cap) are gone; both are now a custom
@@ -269,10 +313,9 @@ All notable changes to Phoenix Engine are documented here. Dates are ISO-8601.
 - Universal content-based transparency: cutout is decided by each texture's
   actual alpha channel (BC3 block inspection); filename heuristics removed.
   Mounts and cloaks now classify their transparency correctly.
-- Canonical DDS pipeline: every texture pre-normalised to BC3 + full mip chain
-  by the new `dds_normalize` tool (`tools/`), activating the renderer's
-  GPU-native upload path — the load-time conversion stage dropped from ~1.1s
-  to ~8ms.
+- Canonical DDS pipeline: production textures were standardised as BC3 with a
+  full mip chain, activating the renderer's GPU-native upload path — the
+  load-time conversion stage dropped from ~1.1s to ~8ms.
 - Per-mount data-driven seat bone (`Bone` column), secondary-rider placeholder
   (`Bone2`), and alternate ride animation flag (`AlternateAnimation`) in the
   vehicle CSVs.

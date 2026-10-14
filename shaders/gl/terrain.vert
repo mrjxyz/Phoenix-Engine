@@ -28,21 +28,21 @@ void main()
     float cp = camera.precomputedTrig.z;
     float sp = camera.precomputedTrig.w;
 
-    float cameraX = cy * delta.x - sy * delta.z;
+    float cameraX = -cy * delta.x + sy * delta.z;
     float yawZ = sy * delta.x + cy * delta.z;
     float cameraY = cp * delta.y - sp * yawZ;
     float cameraZ = sp * delta.y + cp * yawZ;
-    float nearPlane = 2.0;
+    // Match Camera3D's default near plane.  The old 2 m plane clipped the
+    // terrain even after the orbit camera had correctly stopped above it,
+    // which looked exactly like the camera had entered the ground.
+    float nearPlane = 0.05;
 
-    vec3 lightDir = vec3(-0.30, 0.68, -0.67);
-    vec3 n = normalize(inNormal);
-    float nDotL = clamp(dot(n, lightDir), 0.0, 1.0);
-    float lit = nDotL * 0.55 + 0.45;
+    float lit = 1.0;
 
     float fogStart = camera.fogDistances.x;
     float fogEnd = max(fogStart + 1.0, camera.fogDistances.y);
     float fogLinear = clamp((cameraZ - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
-    float fogFactor = 1.0 - exp(-fogLinear * fogLinear * 5.0);
+    float fogFactor = fogLinear * fogLinear;
 
     // Vulkan NDC depth is [0,1] with Y flipped vs GL's [-1,1] with Y up;
     // gl_Position.z here still targets [0,1] via glClipControl-free trick:

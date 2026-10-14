@@ -4,9 +4,9 @@
 #include "platform/sdl_window.h"
 #include "ui/cpu_profiler.h"
 
-#include "imgui.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_sdl2.h"
+#define STBTT_STATIC
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
 
 #include <algorithm>
 #include <array>
@@ -18,10 +18,25 @@
 #include <string>
 #include <vector>
 
+#ifndef GL_R8
+#define GL_R8 0x8229
+#endif
+#ifndef GL_RED
+#define GL_RED 0x1903
+#endif
+
 namespace phoenix::renderer
 {
     namespace
     {
+        struct WorldLabelVertex
+        {
+            float position[2]{};
+            float uv[2]{};
+            float color[4]{};
+            float textured{ 1.0f };
+        };
+
         void* sdl_gl_get_proc(const char* name)
         {
             return SDL_GL_GetProcAddress(name);
@@ -57,17 +72,38 @@ namespace phoenix::renderer
             return result;
         }
 
+        std::string inject_environment_functions(const std::string& source, const std::string& functions)
+        {
+            std::string result = source;
+            const std::string marker = "ENVIRONMENT_FUNCTIONS";
+            const auto pos = result.find(marker);
+            if (pos != std::string::npos)
+                result.replace(pos, marker.size(), functions);
+            return result;
+        }
+
         bool read_text_file(const std::filesystem::path& relativePath, std::string& out)
         {
             const auto cwd = std::filesystem::current_path();
             const auto exeDir = executable_dir();
-            const std::filesystem::path candidates[] = {
-                cwd / relativePath,
-                cwd.parent_path() / relativePath,
-                cwd.parent_path().parent_path().parent_path() / relativePath,
-                exeDir / relativePath,
-                exeDir.parent_path() / relativePath,
+            std::vector<std::filesystem::path> candidates;
+            candidates.reserve(12);
+            const auto append_ancestors = [&](std::filesystem::path directory) {
+                for (int depth = 0; depth < 6 && !directory.empty(); ++depth)
+                {
+                    candidates.push_back(directory / relativePath);
+                    const auto parent = directory.parent_path();
+                    if (parent == directory)
+                        break;
+                    directory = parent;
+                }
             };
+            // File-manager launches inherit an arbitrary working directory.
+            // Search both it and the executable's ancestry: development
+            // binaries live under source/build/<configuration>, while a
+            // distributed binary has shaders/ directly beside it.
+            append_ancestors(exeDir);
+            append_ancestors(cwd);
             for (const auto& candidate : candidates)
             {
                 std::ifstream input(candidate, std::ios::binary | std::ios::ate);
@@ -84,7 +120,7 @@ namespace phoenix::renderer
 
         GLuint build_program(const char* vertRelPath, const char* fragRelPath)
         {
-            std::string vertSrc, fragSrc, cameraBlock;
+            std::string vertSrc, fragSrc, cameraBlock, environmentFunctions;
             if (!read_text_file(vertRelPath, vertSrc) || !read_text_file(fragRelPath, fragSrc))
                 return 0;
             if (!read_text_file("shaders/gl/common_camera.glsl", cameraBlock))
@@ -92,6 +128,14 @@ namespace phoenix::renderer
 
             vertSrc = inject_camera_block(vertSrc, cameraBlock);
             fragSrc = inject_camera_block(fragSrc, cameraBlock);
+            if (vertSrc.find("ENVIRONMENT_FUNCTIONS") != std::string::npos
+                || fragSrc.find("ENVIRONMENT_FUNCTIONS") != std::string::npos)
+            {
+                if (!read_text_file("shaders/gl/common_environment.glsl", environmentFunctions))
+                    return 0;
+                vertSrc = inject_environment_functions(vertSrc, environmentFunctions);
+                fragSrc = inject_environment_functions(fragSrc, environmentFunctions);
+            }
 
             GLuint vs = compile_shader(GL_VERTEX_SHADER, vertSrc);
             GLuint fs = vs ? compile_shader(GL_FRAGMENT_SHADER, fragSrc) : 0;
@@ -122,9 +166,162 @@ namespace phoenix::renderer
             return program;
         }
 
-        void set_camera_ubo(GLuint ubo, const float* constants64)
+        constexpr std::size_t kCameraConstantFloatCount = 144;
+
+        void build_directional_shadow_matrix(float (&matrix)[16],
+            const float* camera, const float* lightDirection, float farPlane)
         {
-            glNamedBufferSubData_(ubo, 0, sizeof(float) * 64, constants64);
+            const auto normalize3 = [](float (&value)[3]) {
+                const auto length = std::sqrt(value[0] * value[0] + value[1] * value[1]
+                    + value[2] * value[2]);
+                const auto inverse = length > 0.00001f ? 1.0f / length : 1.0f;
+                value[0] *= inverse; value[1] *= inverse; value[2] *= inverse;
+            };
+            const auto cross3 = [](const float* a, const float* b, float (&result)[3]) {
+                result[0] = a[1] * b[2] - a[2] * b[1];
+                result[1] = a[2] * b[0] - a[0] * b[2];
+                result[2] = a[0] * b[1] - a[1] * b[0];
+            };
+            const auto dot3 = [](const float* a, const float* b) {
+                return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            };
+
+            float forward[3]{ -lightDirection[0], -lightDirection[1], -lightDirection[2] };
+            normalize3(forward);
+            float worldUp[3]{ 0.0f, 1.0f, 0.0f };
+            float right[3]{};
+            cross3(forward, worldUp, right);
+            if (std::abs(right[0]) + std::abs(right[1]) + std::abs(right[2]) < 0.001f)
+            {
+                worldUp[0] = 0.0f; worldUp[1] = 0.0f; worldUp[2] = 1.0f;
+                cross3(forward, worldUp, right);
+            }
+            normalize3(right);
+            float up[3]{};
+            cross3(right, forward, up);
+            normalize3(up);
+
+            const auto radius = std::clamp(farPlane * 0.58f, 220.0f, 850.0f);
+            const auto depth = radius * 2.4f;
+            float center[3]{
+                camera[0] + camera[9] * radius * 0.28f,
+                camera[1] - 35.0f,
+                camera[2] + camera[8] * radius * 0.28f,
+            };
+            // Snap the light-space center to texel increments. This prevents
+            // the directional map from swimming while the camera moves.
+            const auto worldUnitsPerTexel = radius * 2.0f / 2048.0f;
+            const auto rightCenter = std::round(dot3(right, center) / worldUnitsPerTexel)
+                * worldUnitsPerTexel;
+            const auto upCenter = std::round(dot3(up, center) / worldUnitsPerTexel)
+                * worldUnitsPerTexel;
+            const auto forwardCenter = dot3(forward, center);
+
+            std::fill(matrix, matrix + 16, 0.0f);
+            matrix[0] = right[0] / radius;
+            matrix[4] = right[1] / radius;
+            matrix[8] = right[2] / radius;
+            matrix[12] = -rightCenter / radius;
+            matrix[1] = up[0] / radius;
+            matrix[5] = up[1] / radius;
+            matrix[9] = up[2] / radius;
+            matrix[13] = -upCenter / radius;
+            matrix[2] = forward[0] / depth;
+            matrix[6] = forward[1] / depth;
+            matrix[10] = forward[2] / depth;
+            matrix[14] = -forwardCenter / depth;
+            matrix[15] = 1.0f;
+        }
+
+        std::uint32_t hash_grid(std::uint32_t x, std::uint32_t y, std::uint32_t seed)
+        {
+            std::uint32_t value = x * 0x8da6b343u ^ y * 0xd8163841u ^ seed * 0xcb1ab31fu;
+            value ^= value >> 13u;
+            value *= 0x85ebca6bu;
+            value ^= value >> 16u;
+            return value;
+        }
+
+        float periodic_value_noise(float x, float y, std::uint32_t period, std::uint32_t seed)
+        {
+            const auto x0 = static_cast<std::uint32_t>(std::floor(x)) % period;
+            const auto y0 = static_cast<std::uint32_t>(std::floor(y)) % period;
+            const auto x1 = (x0 + 1u) % period;
+            const auto y1 = (y0 + 1u) % period;
+            auto random01 = [seed](std::uint32_t gx, std::uint32_t gy) {
+                return static_cast<float>(hash_grid(gx, gy, seed) & 0x00ffffffu)
+                    / static_cast<float>(0x00ffffffu);
+            };
+            auto tx = x - std::floor(x);
+            auto ty = y - std::floor(y);
+            tx = tx * tx * (3.0f - 2.0f * tx);
+            ty = ty * ty * (3.0f - 2.0f * ty);
+            const auto top = random01(x0, y0) + (random01(x1, y0) - random01(x0, y0)) * tx;
+            const auto bottom = random01(x0, y1) + (random01(x1, y1) - random01(x0, y1)) * tx;
+            return top + (bottom - top) * ty;
+        }
+
+        std::vector<std::uint8_t> make_environment_normal_noise(std::uint32_t side)
+        {
+            std::vector<float> height(static_cast<std::size_t>(side) * side);
+            for (std::uint32_t y = 0; y < side; ++y)
+            {
+                for (std::uint32_t x = 0; x < side; ++x)
+                {
+                    float value = 0.0f;
+                    float amplitude = 0.5f;
+                    float totalAmplitude = 0.0f;
+                    std::uint32_t period = 4u;
+                    for (std::uint32_t octave = 0; octave < 4u; ++octave)
+                    {
+                        const auto fx = static_cast<float>(x) * static_cast<float>(period) / static_cast<float>(side);
+                        const auto fy = static_cast<float>(y) * static_cast<float>(period) / static_cast<float>(side);
+                        value += periodic_value_noise(fx, fy, period, 0x50484f45u + octave * 977u) * amplitude;
+                        totalAmplitude += amplitude;
+                        amplitude *= 0.5f;
+                        period *= 2u;
+                    }
+                    height[static_cast<std::size_t>(y) * side + x] = value / totalAmplitude;
+                }
+            }
+
+            std::vector<std::uint8_t> rgba(static_cast<std::size_t>(side) * side * 4u);
+            const auto wrap = [side](int value) {
+                value %= static_cast<int>(side);
+                return static_cast<std::uint32_t>(value < 0 ? value + static_cast<int>(side) : value);
+            };
+            for (std::uint32_t y = 0; y < side; ++y)
+            {
+                for (std::uint32_t x = 0; x < side; ++x)
+                {
+                    const auto sample = [&](int sx, int sy) {
+                        return height[static_cast<std::size_t>(wrap(sy)) * side + wrap(sx)];
+                    };
+                    const auto dx = sample(static_cast<int>(x) + 1, static_cast<int>(y))
+                        - sample(static_cast<int>(x) - 1, static_cast<int>(y));
+                    const auto dz = sample(static_cast<int>(x), static_cast<int>(y) + 1)
+                        - sample(static_cast<int>(x), static_cast<int>(y) - 1);
+                    float nx = -dx * 6.0f;
+                    float ny = 1.0f;
+                    float nz = -dz * 6.0f;
+                    const auto inverseLength = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+                    nx *= inverseLength;
+                    ny *= inverseLength;
+                    nz *= inverseLength;
+                    const auto offset = (static_cast<std::size_t>(y) * side + x) * 4u;
+                    rgba[offset + 0u] = static_cast<std::uint8_t>(std::clamp(nx * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
+                    rgba[offset + 1u] = static_cast<std::uint8_t>(std::clamp(nz * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
+                    rgba[offset + 2u] = static_cast<std::uint8_t>(std::clamp(ny * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
+                    rgba[offset + 3u] = static_cast<std::uint8_t>(std::clamp(height[static_cast<std::size_t>(y) * side + x], 0.0f, 1.0f) * 255.0f);
+                }
+            }
+            return rgba;
+        }
+
+        void set_camera_ubo(GLuint ubo, const float* constants)
+        {
+            glNamedBufferSubData_(ubo, 0,
+                sizeof(float) * kCameraConstantFloatCount, constants);
         }
     }
 
@@ -135,6 +332,11 @@ namespace phoenix::renderer
 
     bool OpenGLRenderer::initialize(SDL_Window* window, std::uint32_t width, std::uint32_t height)
     {
+        if (impl_)
+        {
+            log_line("GL: renderer is already initialized");
+            return false;
+        }
         impl_ = new Impl{};
         impl_->window = window;
         impl_->glContext = SDL_GL_GetCurrentContext();
@@ -152,6 +354,10 @@ namespace phoenix::renderer
         const char* renderer = reinterpret_cast<const char*>(glGetString_(GL_RENDERER));
         impl_->adapterName = renderer ? renderer : "Unknown GL device";
         adapterName_ = impl_->adapterName;
+        GLint maxArrayLayers = 0;
+        glGetIntegerv_(GL_MAX_ARRAY_TEXTURE_LAYERS, &maxArrayLayers);
+        if (maxArrayLayers > 0)
+            impl_->maxImageArrayLayers = static_cast<std::uint32_t>(maxArrayLayers);
 
         glEnable_(GL_DEPTH_TEST);
         glDepthFunc_(GL_LESS);
@@ -161,7 +367,8 @@ namespace phoenix::renderer
         glViewport_(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
 
         glCreateBuffers_(1, &impl_->cameraUbo);
-        glNamedBufferData_(impl_->cameraUbo, sizeof(float) * 64, nullptr, GL_DYNAMIC_DRAW);
+        glNamedBufferData_(impl_->cameraUbo,
+            sizeof(float) * kCameraConstantFloatCount, nullptr, GL_DYNAMIC_DRAW);
         glBindBufferBase_(GL_UNIFORM_BUFFER, 0, impl_->cameraUbo);
 
         glCreateVertexArrays_(1, &impl_->emptyVao);
@@ -182,90 +389,165 @@ namespace phoenix::renderer
             log_line("GL: skinned character pipeline unavailable (non-fatal)");
         if (!create_effect_particle_pipeline())
             log_line("GL: effect particle pipeline unavailable (non-fatal)");
+        impl_->worldLabelProgram = build_program("shaders/gl/world_label.vert", "shaders/gl/world_label.frag");
+        if (impl_->worldLabelProgram)
+        {
+            static constexpr int atlasWidth = 512;
+            static constexpr int atlasHeight = 512;
+            std::vector<std::uint8_t> fontBytes;
+            const auto exeDir = executable_dir();
+            const auto cwd = std::filesystem::current_path();
+            for (const auto& fontPath : {
+                exeDir / "assets/fonts/NotoSans-Regular.ttf",
+                cwd / "assets/fonts/NotoSans-Regular.ttf",
+                std::filesystem::path("C:\\Windows\\Fonts\\arial.ttf"),
+                std::filesystem::path("C:\\Windows\\Fonts\\ARIAL.TTF"),
+                std::filesystem::path("/usr/share/fonts/noto/NotoSans-Regular.ttf"),
+                std::filesystem::path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+                std::filesystem::path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") })
+            {
+                std::ifstream input(fontPath, std::ios::binary | std::ios::ate);
+                if (!input)
+                    continue;
+                const auto size = input.tellg();
+                if (size <= 0)
+                    continue;
+                fontBytes.resize(static_cast<std::size_t>(size));
+                input.seekg(0, std::ios::beg);
+                input.read(reinterpret_cast<char*>(fontBytes.data()), static_cast<std::streamsize>(fontBytes.size()));
+                if (input)
+                    break;
+                fontBytes.clear();
+            }
+
+            std::vector<std::uint8_t> atlas(static_cast<std::size_t>(atlasWidth) * atlasHeight);
+            std::array<stbtt_bakedchar, 224> baked{};
+            if (!fontBytes.empty()
+                && stbtt_BakeFontBitmap(fontBytes.data(), 0, 14.0f, atlas.data(),
+                    atlasWidth, atlasHeight, 32, static_cast<int>(baked.size()), baked.data()) > 0)
+            {
+                for (std::size_t i = 0; i < baked.size(); ++i)
+                {
+                    const auto& source = baked[i];
+                    auto& glyph = impl_->worldLabelGlyphs[i];
+                    glyph.x0 = source.xoff;
+                    glyph.y0 = source.yoff;
+                    glyph.x1 = source.xoff + static_cast<float>(source.x1 - source.x0);
+                    glyph.y1 = source.yoff + static_cast<float>(source.y1 - source.y0);
+                    glyph.u0 = static_cast<float>(source.x0) / atlasWidth;
+                    glyph.v0 = static_cast<float>(source.y0) / atlasHeight;
+                    glyph.u1 = static_cast<float>(source.x1) / atlasWidth;
+                    glyph.v1 = static_cast<float>(source.y1) / atlasHeight;
+                    glyph.advance = source.xadvance;
+                }
+
+                glGenTextures_(1, &impl_->worldLabelTexture);
+                glBindTexture_(GL_TEXTURE_2D, impl_->worldLabelTexture);
+                glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D_(GL_TEXTURE_2D, 0, GL_R8, atlasWidth, atlasHeight, 0,
+                    GL_RED, GL_UNSIGNED_BYTE, atlas.data());
+                glBindTexture_(GL_TEXTURE_2D, 0);
+
+                glCreateBuffers_(1, &impl_->worldLabelVertexBuffer.id);
+                glNamedBufferData_(impl_->worldLabelVertexBuffer.id, 1, nullptr, GL_DYNAMIC_DRAW);
+                impl_->worldLabelVertexBuffer.byteSize = 1;
+                glCreateVertexArrays_(1, &impl_->worldLabelVao);
+                glBindVertexArray_(impl_->worldLabelVao);
+                glBindBuffer_(GL_ARRAY_BUFFER, impl_->worldLabelVertexBuffer.id);
+                const auto stride = static_cast<GLsizei>(sizeof(WorldLabelVertex));
+                glEnableVertexAttribArray_(0);
+                glVertexAttribPointer_(0, 2, GL_FLOAT, GL_FALSE, stride,
+                    reinterpret_cast<const void*>(offsetof(WorldLabelVertex, position)));
+                glEnableVertexAttribArray_(1);
+                glVertexAttribPointer_(1, 2, GL_FLOAT, GL_FALSE, stride,
+                    reinterpret_cast<const void*>(offsetof(WorldLabelVertex, uv)));
+                glEnableVertexAttribArray_(2);
+                glVertexAttribPointer_(2, 4, GL_FLOAT, GL_FALSE, stride,
+                    reinterpret_cast<const void*>(offsetof(WorldLabelVertex, color)));
+                glEnableVertexAttribArray_(3);
+                glVertexAttribPointer_(3, 1, GL_FLOAT, GL_FALSE, stride,
+                    reinterpret_cast<const void*>(offsetof(WorldLabelVertex, textured)));
+                glBindVertexArray_(0);
+                impl_->worldLabelsReady = true;
+            }
+            else
+            {
+                glDeleteProgram_(impl_->worldLabelProgram);
+                impl_->worldLabelProgram = 0;
+                log_line("GL: native world-label font unavailable");
+            }
+        }
+        else
+        {
+            log_line("GL: native world-label shaders unavailable");
+        }
         if (!create_sky_pipeline())
             log_line("GL: sky pipeline unavailable (non-fatal)");
-        create_cull_compute_pipeline(); // stub: GPU culling stays disabled, see internal header note
+        impl_->shadowTerrainProgram = build_program("shaders/gl/shadow_terrain.vert", "shaders/gl/shadow_depth.frag");
+        impl_->shadowStaticProgram = build_program("shaders/gl/shadow_static.vert", "shaders/gl/shadow_depth.frag");
+        impl_->shadowSkinnedProgram = build_program("shaders/gl/shadow_skinned.vert", "shaders/gl/shadow_depth.frag");
         create_descriptor_resources();
+
+        if (impl_->shadowTerrainProgram && impl_->shadowStaticProgram && impl_->shadowSkinnedProgram)
+        {
+            glGenTextures_(1, &impl_->shadowDepthTexture);
+            glBindTexture_(GL_TEXTURE_2D, impl_->shadowDepthTexture);
+            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D_(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F,
+                static_cast<GLsizei>(Impl::shadowResolution), static_cast<GLsizei>(Impl::shadowResolution),
+                0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+            glBindTexture_(GL_TEXTURE_2D, 0);
+
+            glGenFramebuffers_(1, &impl_->shadowFramebuffer);
+            glBindFramebuffer_(GL_FRAMEBUFFER, impl_->shadowFramebuffer);
+            glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
+                impl_->shadowDepthTexture, 0);
+            glDrawBuffer_(GL_NONE);
+            glReadBuffer_(GL_NONE);
+            impl_->shadowReady = glCheckFramebufferStatus_(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+            glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+
+            glCreateSamplers_(1, &impl_->shadowSampler);
+            glSamplerParameteri_(impl_->shadowSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glSamplerParameteri_(impl_->shadowSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glSamplerParameteri_(impl_->shadowSampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glSamplerParameteri_(impl_->shadowSampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            if (!impl_->shadowReady)
+                log_line("GL: directional shadow framebuffer unavailable");
+        }
+        else
+        {
+            log_line("GL: directional shadow shaders unavailable");
+        }
 
         ready_ = true;
         log_line("GL: initialized");
         return true;
     }
 
-    bool OpenGLRenderer::initialize_imgui(SDL_Window* window)
+    void OpenGLRenderer::set_world_labels(std::vector<ScreenLabel> labels)
     {
-        if (!ready_ || imguiReady_)
-            return ready_;
-
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        auto& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        static std::string imguiIniPath = (executable_dir() / "imgui.ini").string();
-        io.IniFilename = imguiIniPath.c_str();
-        ImGui::StyleColorsDark();
-
-        io.Fonts->AddFontDefault();
-        npcLabelFont_ = nullptr;
-        for (const char* arialPath : { "C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\ARIAL.TTF" })
-        {
-            std::error_code ec;
-            if (std::filesystem::exists(arialPath, ec))
-            {
-                npcLabelFont_ = io.Fonts->AddFontFromFileTTF(arialPath, 14.0f);
-                break;
-            }
-        }
-
-        if (!ImGui_ImplSDL2_InitForOpenGL(window, impl_->glContext))
-            return false;
-
-        if (!ImGui_ImplOpenGL3_Init("#version 450 core"))
-        {
-            ImGui_ImplSDL2_Shutdown();
-            ImGui::DestroyContext();
-            return false;
-        }
-
-        imguiReady_ = true;
-        log_line("ImGui: initialized");
-        return true;
-    }
-
-    void OpenGLRenderer::begin_imgui_frame()
-    {
-        if (!imguiReady_)
+        if (!impl_)
             return;
-
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL2_NewFrame();
-        ImGui::NewFrame();
-        imguiFrameStarted_ = true;
+        impl_->worldLabels = std::move(labels);
     }
 
-    std::uint64_t OpenGLRenderer::upload_imgui_icon_rgba(
-        const std::uint8_t* rgba,
-        std::uint32_t width,
-        std::uint32_t height)
+    void OpenGLRenderer::set_screen_ui(std::vector<ScreenUiCommand> commands)
     {
-        if (!ready_ || !imguiReady_ || !rgba || width == 0 || height == 0)
-            return 0;
+        if (!impl_)
+            return;
+        impl_->screenUi = std::move(commands);
+    }
 
-        GLuint tex{};
-        glCreateTextures_(GL_TEXTURE_2D, 1, &tex);
-        glTextureParameteri_(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTextureParameteri_(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTextureParameteri_(tex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTextureParameteri_(tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindTexture_(GL_TEXTURE_2D, tex);
-        glTexImage2D_(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width), static_cast<GLsizei>(height),
-            0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-        glBindTexture_(GL_TEXTURE_2D, 0);
-
-        Impl::ImguiIconTexture icon{};
-        icon.texture = tex;
-        impl_->imguiIconTextures.push_back(icon);
-        return static_cast<std::uint64_t>(tex);
+    bool OpenGLRenderer::native_ui_available() const
+    {
+        return impl_ && impl_->worldLabelsReady && impl_->worldLabelProgram;
     }
 
     std::uint32_t OpenGLRenderer::surface_width() const
@@ -276,6 +558,11 @@ namespace phoenix::renderer
     std::uint32_t OpenGLRenderer::surface_height() const
     {
         return impl_ ? impl_->surfaceHeight : 0;
+    }
+
+    std::uint32_t OpenGLRenderer::max_texture_array_layers() const
+    {
+        return impl_ ? impl_->maxImageArrayLayers : 0;
     }
 
     std::uint64_t OpenGLRenderer::vram_total_bytes() const
@@ -343,6 +630,35 @@ namespace phoenix::renderer
         GLfloat maxAniso = 1.0f;
         glGetFloatv_(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAniso);
         glSamplerParameterf_(impl_->terrainSampler, GL_TEXTURE_MAX_ANISOTROPY, std::min(16.0f, maxAniso > 0.0f ? maxAniso : 1.0f));
+
+        // Godot's standard world-asset materials use ordinary trilinear
+        // mipmapping.  Keep terrain anisotropy independent: forcing its 16x
+        // sampler onto nearby props preserves excessive high-frequency detail
+        // at grazing angles and makes their textures shimmer while moving.
+        glCreateSamplers_(1, &impl_->assetSampler);
+        glSamplerParameteri_(impl_->assetSampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glSamplerParameteri_(impl_->assetSampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glSamplerParameteri_(impl_->assetSampler, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glSamplerParameteri_(impl_->assetSampler, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glSamplerParameteri_(impl_->assetSampler, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+        glSamplerParameterf_(impl_->assetSampler, GL_TEXTURE_MAX_ANISOTROPY, 1.0f);
+
+        // One tiny procedural texture supplies both the seamless cloud noise
+        // (alpha) and the generated water normal map (rgb). It mirrors the
+        // Godot implementation without adding an external runtime asset.
+        constexpr std::uint32_t environmentNoiseSide = 256u;
+        const auto environmentNoise = make_environment_normal_noise(environmentNoiseSide);
+        glGenTextures_(1, &impl_->environmentNoiseTexture);
+        glBindTexture_(GL_TEXTURE_2D, impl_->environmentNoiseTexture);
+        glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D_(GL_TEXTURE_2D, 0, GL_RGBA8,
+            static_cast<GLsizei>(environmentNoiseSide), static_cast<GLsizei>(environmentNoiseSide),
+            0, GL_RGBA, GL_UNSIGNED_BYTE, environmentNoise.data());
+        glGenerateMipmap_(GL_TEXTURE_2D);
+        glBindTexture_(GL_TEXTURE_2D, 0);
 
         // No mipmaps: the debug effect array is always uploaded with a single
         // level (see upload_debug_effect_textures), so MIN_FILTER must not
@@ -431,18 +747,6 @@ namespace phoenix::renderer
         return true;
     }
 
-    bool OpenGLRenderer::create_cull_compute_pipeline()
-    {
-        // GPU frustum culling / indirect draw is intentionally not wired up:
-        // the original Vulkan renderer's upload_indirect_draw_data() early-
-        // returns false permanently ("single indirect buffer is not frame-
-        // safe"), so indirectReady is always false there and the direct
-        // per-batch draw path is the only one that ever executes. Preserving
-        // that exact behavior here for parity; static objects always draw via
-        // the direct per-batch loop in render_frame().
-        return true;
-    }
-
     bool OpenGLRenderer::create_sky_pipeline()
     {
         impl_->skyProgram = build_program("shaders/gl/sky.vert", "shaders/gl/sky.frag");
@@ -470,6 +774,70 @@ namespace phoenix::renderer
             glNamedBufferData_(buf.id, static_cast<GLsizeiptr>(byteSize), data, usage);
             buf.byteSize = byteSize;
             return buf;
+        }
+
+        void upload_growing_buffer(GlBuffer& buffer, const void* data,
+            std::size_t requiredBytes, GLenum usage)
+        {
+            if (requiredBytes == 0 || !data)
+                return;
+            if (buffer.id && requiredBytes <= buffer.byteSize)
+            {
+                glNamedBufferSubData_(buffer.id, 0,
+                    static_cast<GLsizeiptr>(requiredBytes), data);
+                return;
+            }
+
+            destroy_gl_buffer(buffer);
+            const auto capacity = requiredBytes + requiredBytes / 2u;
+            glCreateBuffers_(1, &buffer.id);
+            glNamedBufferData_(buffer.id, static_cast<GLsizeiptr>(capacity), nullptr, usage);
+            glNamedBufferSubData_(buffer.id, 0,
+                static_cast<GLsizeiptr>(requiredBytes), data);
+            buffer.byteSize = capacity;
+        }
+
+        struct DrawElementsIndirectCommand
+        {
+            std::uint32_t count{};
+            std::uint32_t instanceCount{};
+            std::uint32_t firstIndex{};
+            std::int32_t baseVertex{};
+            std::uint32_t baseInstance{};
+        };
+        static_assert(sizeof(DrawElementsIndirectCommand) == 20);
+
+        void update_object_indirect_buffer(GlBuffer& buffer, std::uint32_t& drawCount,
+            const std::vector<ObjectBatch>& batches)
+        {
+            std::vector<DrawElementsIndirectCommand> commands;
+            commands.reserve(batches.size());
+            for (const auto& batch : batches)
+            {
+                if (batch.instanceCount == 0 || batch.indexCount == 0)
+                    continue;
+                commands.push_back({ batch.indexCount, batch.instanceCount,
+                    batch.firstIndex, 0, batch.firstInstance });
+            }
+
+            drawCount = static_cast<std::uint32_t>(commands.size());
+            if (commands.empty())
+                return;
+
+            const auto requiredBytes = commands.size() * sizeof(DrawElementsIndirectCommand);
+            if (!buffer.id)
+                glCreateBuffers_(1, &buffer.id);
+            if (requiredBytes > buffer.byteSize)
+            {
+                glNamedBufferData_(buffer.id, static_cast<GLsizeiptr>(requiredBytes),
+                    commands.data(), GL_DYNAMIC_DRAW);
+                buffer.byteSize = requiredBytes;
+            }
+            else
+            {
+                glNamedBufferSubData_(buffer.id, 0, static_cast<GLsizeiptr>(requiredBytes),
+                    commands.data());
+            }
         }
 
         void setup_terrain_vao_attribs(GLuint vao, GLuint vbo)
@@ -645,16 +1013,16 @@ namespace phoenix::renderer
         const std::vector<std::uint32_t>& indices)
     {
         if (!ready_) return false;
-        destroy_gl_buffer(impl_->terrainVertexBuffer);
-        destroy_gl_buffer(impl_->terrainIndexBuffer);
         impl_->terrainReady = false;
         impl_->terrainIndexCount = 0;
         impl_->terrainDrawRanges.clear();
         if (vertices.empty() || indices.empty())
             return false;
 
-        impl_->terrainVertexBuffer = make_static_buffer(vertices.data(), vertices.size() * sizeof(TerrainVertex));
-        impl_->terrainIndexBuffer = make_static_buffer(indices.data(), indices.size() * sizeof(std::uint32_t));
+        upload_growing_buffer(impl_->terrainVertexBuffer, vertices.data(),
+            vertices.size() * sizeof(TerrainVertex), GL_DYNAMIC_DRAW);
+        upload_growing_buffer(impl_->terrainIndexBuffer, indices.data(),
+            indices.size() * sizeof(std::uint32_t), GL_DYNAMIC_DRAW);
         setup_terrain_vao_attribs(impl_->terrainVao, impl_->terrainVertexBuffer.id);
         glBindVertexArray_(impl_->terrainVao);
         glBindBuffer_(GL_ELEMENT_ARRAY_BUFFER, impl_->terrainIndexBuffer.id);
@@ -728,20 +1096,22 @@ namespace phoenix::renderer
         const std::vector<ObjectBatch>& batches)
     {
         if (!ready_) return false;
-        destroy_gl_buffer(impl_->objectVertexBuffer);
-        destroy_gl_buffer(impl_->objectIndexBuffer);
-        destroy_gl_buffer(impl_->objectInstanceBuffer);
         impl_->objectBatches.clear();
         impl_->objectsReady = false;
         if (vertices.empty() || indices.empty() || instances.empty() || batches.empty())
             return false;
 
-        impl_->objectVertexBuffer = make_static_buffer(vertices.data(), vertices.size() * sizeof(TerrainVertex));
-        impl_->objectIndexBuffer = make_static_buffer(indices.data(), indices.size() * sizeof(std::uint32_t));
-        impl_->objectInstanceBuffer = make_static_buffer(instances.data(), instances.size() * sizeof(ObjectInstance));
+        upload_growing_buffer(impl_->objectVertexBuffer, vertices.data(),
+            vertices.size() * sizeof(TerrainVertex), GL_DYNAMIC_DRAW);
+        upload_growing_buffer(impl_->objectIndexBuffer, indices.data(),
+            indices.size() * sizeof(std::uint32_t), GL_DYNAMIC_DRAW);
+        upload_growing_buffer(impl_->objectInstanceBuffer, instances.data(),
+            instances.size() * sizeof(ObjectInstance), GL_DYNAMIC_DRAW);
         setup_object_vao_attribs(impl_->objectVao, impl_->objectVertexBuffer.id, impl_->objectIndexBuffer.id, impl_->objectInstanceBuffer.id);
 
         impl_->objectBatches = batches;
+        update_object_indirect_buffer(impl_->objectIndirectBuffer,
+            impl_->objectIndirectCount, impl_->objectBatches);
         impl_->objectsReady = true;
         return true;
     }
@@ -750,35 +1120,10 @@ namespace phoenix::renderer
     {
         if (!impl_) return;
         impl_->objectBatches = batches;
+        update_object_indirect_buffer(impl_->objectIndirectBuffer,
+            impl_->objectIndirectCount, impl_->objectBatches);
         impl_->objectsReady = !impl_->objectBatches.empty()
             && impl_->objectVertexBuffer.id && impl_->objectIndexBuffer.id && impl_->objectInstanceBuffer.id;
-    }
-
-    bool OpenGLRenderer::upload_indirect_draw_data(
-        const std::vector<ObjectBatch>&,
-        const std::vector<BatchBoundsGpu>&)
-    {
-        // Kept disabled permanently, matching the original Vulkan renderer
-        // (see the note in opengl_renderer_internal.h / create_cull_compute_pipeline).
-        static bool loggedDisabled = false;
-        if (!loggedDisabled)
-        {
-            log_line("GL: GPU frustum culling disabled (parity with original single-buffer limitation)");
-            loggedDisabled = true;
-        }
-        return false;
-    }
-
-    void OpenGLRenderer::update_indirect_draw_data(
-        const std::vector<ObjectBatch>&,
-        const std::vector<BatchBoundsGpu>&)
-    {
-        // No-op: indirectReady is always false (see upload_indirect_draw_data).
-    }
-
-    bool OpenGLRenderer::indirect_draw_ready() const
-    {
-        return impl_ && impl_->indirectReady;
     }
 
     void OpenGLRenderer::set_animated_object_batches(const std::vector<ObjectBatch>& batches)
@@ -801,6 +1146,8 @@ namespace phoenix::renderer
         impl_->objectInstanceBuffer = make_static_buffer(instances.data(), instances.size() * sizeof(ObjectInstance));
         setup_object_vao_attribs(impl_->objectVao, impl_->objectVertexBuffer.id, impl_->objectIndexBuffer.id, impl_->objectInstanceBuffer.id);
         impl_->objectBatches = batches;
+        update_object_indirect_buffer(impl_->objectIndirectBuffer,
+            impl_->objectIndirectCount, impl_->objectBatches);
         impl_->objectsReady = true;
         return true;
     }
@@ -812,17 +1159,17 @@ namespace phoenix::renderer
         const std::vector<ObjectBatch>& batches)
     {
         if (!ready_) return false;
-        destroy_gl_buffer(impl_->animatedObjectVertexBuffer);
-        destroy_gl_buffer(impl_->animatedObjectIndexBuffer);
-        destroy_gl_buffer(impl_->animatedObjectInstanceBuffer);
         impl_->animatedObjectBatches.clear();
         impl_->animatedObjectsReady = false;
         if (vertices.empty() || indices.empty() || instances.empty() || batches.empty())
             return false;
 
-        impl_->animatedObjectVertexBuffer = make_static_buffer(vertices.data(), vertices.size() * sizeof(TerrainVertex), GL_DYNAMIC_DRAW);
-        impl_->animatedObjectIndexBuffer = make_static_buffer(indices.data(), indices.size() * sizeof(std::uint32_t));
-        impl_->animatedObjectInstanceBuffer = make_static_buffer(instances.data(), instances.size() * sizeof(ObjectInstance), GL_DYNAMIC_DRAW);
+        upload_growing_buffer(impl_->animatedObjectVertexBuffer, vertices.data(),
+            vertices.size() * sizeof(TerrainVertex), GL_DYNAMIC_DRAW);
+        upload_growing_buffer(impl_->animatedObjectIndexBuffer, indices.data(),
+            indices.size() * sizeof(std::uint32_t), GL_DYNAMIC_DRAW);
+        upload_growing_buffer(impl_->animatedObjectInstanceBuffer, instances.data(),
+            instances.size() * sizeof(ObjectInstance), GL_DYNAMIC_DRAW);
         setup_object_vao_attribs(impl_->animatedObjectVao, impl_->animatedObjectVertexBuffer.id,
             impl_->animatedObjectIndexBuffer.id, impl_->animatedObjectInstanceBuffer.id);
 
@@ -838,10 +1185,13 @@ namespace phoenix::renderer
     {
         if (!ready_ || !impl_->animatedObjectsReady || !vertices || vertexCount == 0)
             return false;
-        const auto byteOffset = static_cast<GLintptr>(firstVertex) * sizeof(TerrainVertex);
-        const auto byteSize = static_cast<GLsizeiptr>(vertexCount) * sizeof(TerrainVertex);
-        if (static_cast<std::size_t>(byteOffset + byteSize) > impl_->animatedObjectVertexBytes)
+        const auto byteOffsetSize = static_cast<std::size_t>(firstVertex) * sizeof(TerrainVertex);
+        const auto byteSizeValue = static_cast<std::size_t>(vertexCount) * sizeof(TerrainVertex);
+        if (byteOffsetSize > impl_->animatedObjectVertexBytes
+            || byteSizeValue > impl_->animatedObjectVertexBytes - byteOffsetSize)
             return false;
+        const auto byteOffset = static_cast<GLintptr>(byteOffsetSize);
+        const auto byteSize = static_cast<GLsizeiptr>(byteSizeValue);
         glNamedBufferSubData_(impl_->animatedObjectVertexBuffer.id, byteOffset, byteSize, vertices + firstVertex);
         return true;
     }
@@ -968,10 +1318,13 @@ namespace phoenix::renderer
     {
         if (!ready_ || !impl_->botCharacterReady || !vertices || vertexCount == 0)
             return false;
-        const auto byteOffset = static_cast<GLintptr>(firstVertex) * sizeof(TerrainVertex);
-        const auto byteSize = static_cast<GLsizeiptr>(vertexCount) * sizeof(TerrainVertex);
-        if (static_cast<std::size_t>(byteOffset + byteSize) > impl_->botCharacterVertexBuffer.byteSize)
+        const auto byteOffsetSize = static_cast<std::size_t>(firstVertex) * sizeof(TerrainVertex);
+        const auto byteSizeValue = static_cast<std::size_t>(vertexCount) * sizeof(TerrainVertex);
+        if (byteOffsetSize > impl_->botCharacterVertexBuffer.byteSize
+            || byteSizeValue > impl_->botCharacterVertexBuffer.byteSize - byteOffsetSize)
             return false;
+        const auto byteOffset = static_cast<GLintptr>(byteOffsetSize);
+        const auto byteSize = static_cast<GLsizeiptr>(byteSizeValue);
         glNamedBufferSubData_(impl_->botCharacterVertexBuffer.id, byteOffset, byteSize, vertices + firstVertex);
         return true;
     }
@@ -1030,10 +1383,13 @@ namespace phoenix::renderer
     {
         if (!ready_ || !impl_->monsterCharacterReady || !vertices || vertexCount == 0)
             return false;
-        const auto byteOffset = static_cast<GLintptr>(firstVertex) * sizeof(TerrainVertex);
-        const auto byteSize = static_cast<GLsizeiptr>(vertexCount) * sizeof(TerrainVertex);
-        if (static_cast<std::size_t>(byteOffset + byteSize) > impl_->monsterCharacterVertexBuffer.byteSize)
+        const auto byteOffsetSize = static_cast<std::size_t>(firstVertex) * sizeof(TerrainVertex);
+        const auto byteSizeValue = static_cast<std::size_t>(vertexCount) * sizeof(TerrainVertex);
+        if (byteOffsetSize > impl_->monsterCharacterVertexBuffer.byteSize
+            || byteSizeValue > impl_->monsterCharacterVertexBuffer.byteSize - byteOffsetSize)
             return false;
+        const auto byteOffset = static_cast<GLintptr>(byteOffsetSize);
+        const auto byteSize = static_cast<GLsizeiptr>(byteSizeValue);
         glNamedBufferSubData_(impl_->monsterCharacterVertexBuffer.id, byteOffset, byteSize, vertices + firstVertex);
         return true;
     }
@@ -1152,13 +1508,18 @@ namespace phoenix::renderer
     }
 
     bool OpenGLRenderer::upload_terrain_textures(const std::vector<DdsTexture>& textures,
-        const std::function<void()>& pump)
+        const std::function<void()>& pump,
+        std::uint32_t assetFirstLayer,
+        std::uint32_t assetLayerCount)
     {
         if (!ready_) return false;
 
         if (impl_->terrainTextureArray.id)
             glDeleteTextures_(1, &impl_->terrainTextureArray.id);
+        if (impl_->assetTextureArray.id)
+            glDeleteTextures_(1, &impl_->assetTextureArray.id);
         impl_->terrainTextureArray = {};
+        impl_->assetTextureArray = {};
         impl_->terrainTextureLayerCount = 0;
         impl_->terrainTextureWidth = 0;
         impl_->terrainTextureHeight = 0;
@@ -1166,6 +1527,13 @@ namespace phoenix::renderer
         impl_->terrainTextureFormat = 0;
         impl_->terrainTextureCompressed = false;
         impl_->terrainTexturesReady = false;
+        impl_->assetTexturesReady = false;
+        impl_->assetTextureFirstLayer = 0;
+        impl_->assetTextureEndLayer = 0;
+        impl_->assetTextureWidth = 0;
+        impl_->assetTextureHeight = 0;
+        impl_->assetTextureMipLevels = 0;
+        impl_->assetTextureFormat = 0;
 
         if (textures.empty())
             return false;
@@ -1282,6 +1650,71 @@ namespace phoenix::renderer
         impl_->terrainTextureWidth = texWidth;
         impl_->terrainTextureHeight = texHeight;
         impl_->terrainTexturesReady = true;
+
+        // The legacy DDS files contain pre-generated mip chains whose small
+        // levels shimmer noticeably as the camera moves. Godot discards those
+        // levels and builds a fresh chain from the source image. Reproduce
+        // that behaviour only for world assets in a compact secondary array:
+        // upload mip 0, let the driver generate all lower BC levels, then bind
+        // this array solely while drawing static/animated world props. Terrain,
+        // sky, water, effects and character textures retain their original
+        // chains in terrainTextureArray.
+        const auto assetEndLayer = std::min(layerCount, assetFirstLayer + assetLayerCount);
+        if (canUploadBc && nativeFormat != 0 && nativeMips > 1
+            && assetFirstLayer < assetEndLayer)
+        {
+            GLuint assetTexId{};
+            glCreateTextures_(GL_TEXTURE_2D_ARRAY, 1, &assetTexId);
+            const GLenum internalFormat = bc_gl_internal_format(nativeFormat);
+            glTextureStorage3D_(assetTexId, static_cast<GLsizei>(nativeMips), internalFormat,
+                static_cast<GLsizei>(texWidth), static_cast<GLsizei>(texHeight),
+                static_cast<GLsizei>(assetEndLayer));
+
+            for (std::uint32_t layer = assetFirstLayer; layer < assetEndLayer; ++layer)
+            {
+                if (pump && (layer & 63u) == 0u)
+                    pump();
+                const std::vector<std::uint8_t>* src{};
+                std::vector<std::uint8_t> fallback;
+                if (textures[layer].valid && !textures[layer].mipData.empty())
+                    src = &textures[layer].mipData[0];
+                else
+                {
+                    fallback = make_bc_fallback_mip(nativeFormat, texWidth, texHeight);
+                    src = &fallback;
+                }
+                glCompressedTextureSubImage3D_(assetTexId, 0,
+                    0, 0, static_cast<GLint>(layer),
+                    static_cast<GLsizei>(texWidth), static_cast<GLsizei>(texHeight), 1,
+                    internalFormat, static_cast<GLsizei>(src->size()), src->data());
+            }
+
+            // Ignore any stale error raised before this isolated operation so
+            // unsupported compressed-mipmap generation has a reliable fallback.
+            while (glGetError_() != GL_NO_ERROR) {}
+            glGenerateTextureMipmap_(assetTexId);
+            const auto mipError = glGetError_();
+            if (mipError == GL_NO_ERROR)
+            {
+                glTextureParameteri_(assetTexId, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTextureParameteri_(assetTexId, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTextureParameteri_(assetTexId, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                glTextureParameteri_(assetTexId, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                impl_->assetTextureArray.id = assetTexId;
+                impl_->assetTexturesReady = true;
+                impl_->assetTextureFirstLayer = assetFirstLayer;
+                impl_->assetTextureEndLayer = assetEndLayer;
+                impl_->assetTextureWidth = texWidth;
+                impl_->assetTextureHeight = texHeight;
+                impl_->assetTextureMipLevels = nativeMips;
+                impl_->assetTextureFormat = nativeFormat;
+            }
+            else
+            {
+                glDeleteTextures_(1, &assetTexId);
+                log_line("GL: compressed world-asset mip regeneration unsupported; using DDS mip chains");
+            }
+        }
         return true;
     }
 
@@ -1424,18 +1857,55 @@ namespace phoenix::renderer
     {
         if (!ready_ || !impl_->terrainTexturesReady || textures.empty())
             return false;
-        if (firstLayer + textures.size() > impl_->terrainTextureLayerCount)
+        if (firstLayer >= impl_->terrainTextureLayerCount
+            || textures.size() > impl_->terrainTextureLayerCount - firstLayer)
             return false;
 
+        bool uploadedAny = false;
+        bool payloadsValid = true;
         for (std::size_t i = 0; i < textures.size(); ++i)
         {
             const auto& tex = textures[i];
             const auto layer = static_cast<GLint>(firstLayer + i);
             if (impl_->terrainTextureCompressed)
             {
-                if (!tex.valid || tex.mipData.empty()) continue;
+                // Compressed sub-image dimensions and format must exactly match
+                // the immutable array storage. OpenGL otherwise rejects the
+                // update while the old fallback layer remains visible.
+                if (!tex.valid)
+                    continue; // Empty reserved slots are intentional.
+                if (!tex.compressed || tex.vkFormat != impl_->terrainTextureFormat
+                    || tex.width != impl_->terrainTextureWidth
+                    || tex.height != impl_->terrainTextureHeight
+                    || tex.mipData.size() < impl_->terrainTextureMipLevels)
+                {
+                    payloadsValid = false;
+                    continue;
+                }
+
+                bool mipPayloadsValid = true;
+                const auto blockBytes = bc_block_bytes(impl_->terrainTextureFormat);
+                for (std::uint32_t mip = 0; mip < impl_->terrainTextureMipLevels; ++mip)
+                {
+                    const auto mipW = std::max(1u, impl_->terrainTextureWidth >> mip);
+                    const auto mipH = std::max(1u, impl_->terrainTextureHeight >> mip);
+                    const auto blocksW = std::max(1u, (mipW + 3u) / 4u);
+                    const auto blocksH = std::max(1u, (mipH + 3u) / 4u);
+                    const auto expectedSize = static_cast<std::size_t>(blocksW) * blocksH * blockBytes;
+                    if (tex.mipData[mip].size() != expectedSize)
+                    {
+                        mipPayloadsValid = false;
+                        break;
+                    }
+                }
+                if (!mipPayloadsValid)
+                {
+                    payloadsValid = false;
+                    continue;
+                }
+
                 const GLenum internalFormat = bc_gl_internal_format(impl_->terrainTextureFormat);
-                for (std::uint32_t mip = 0; mip < impl_->terrainTextureMipLevels && mip < tex.mipData.size(); ++mip)
+                for (std::uint32_t mip = 0; mip < impl_->terrainTextureMipLevels; ++mip)
                 {
                     const auto mipW = std::max(1u, impl_->terrainTextureWidth >> mip);
                     const auto mipH = std::max(1u, impl_->terrainTextureHeight >> mip);
@@ -1443,20 +1913,151 @@ namespace phoenix::renderer
                     glCompressedTextureSubImage3D_(impl_->terrainTextureArray.id, static_cast<GLint>(mip),
                         0, 0, layer, static_cast<GLsizei>(mipW), static_cast<GLsizei>(mipH), 1,
                         internalFormat, static_cast<GLsizei>(src.size()), src.data());
+                    if (impl_->assetTexturesReady
+                        && firstLayer + i >= impl_->assetTextureFirstLayer
+                        && firstLayer + i < impl_->assetTextureEndLayer)
+                    {
+                        glCompressedTextureSubImage3D_(impl_->assetTextureArray.id, static_cast<GLint>(mip),
+                            0, 0, layer, static_cast<GLsizei>(mipW), static_cast<GLsizei>(mipH), 1,
+                            internalFormat, static_cast<GLsizei>(src.size()), src.data());
+                    }
                 }
+                uploadedAny = true;
             }
             else
             {
                 if (!tex.valid) continue;
                 auto decoded = decode_texture_rgba(tex);
                 if (decoded.empty() || tex.width != impl_->terrainTextureWidth || tex.height != impl_->terrainTextureHeight)
+                {
+                    payloadsValid = false;
                     continue;
+                }
                 glTextureSubImage3D_(impl_->terrainTextureArray.id, 0, 0, 0, layer,
                     static_cast<GLsizei>(impl_->terrainTextureWidth), static_cast<GLsizei>(impl_->terrainTextureHeight), 1,
                     GL_RGBA, GL_UNSIGNED_BYTE, decoded.data());
+                uploadedAny = true;
             }
         }
+        return uploadedAny && payloadsValid;
+    }
+
+    bool OpenGLRenderer::configure_streamed_asset_texture_pool(
+        std::uint32_t firstLayer,
+        std::uint32_t layerCount,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t mipLevels)
+    {
+        if (!ready_ || !impl_->terrainTexturesReady || !impl_->terrainTextureCompressed
+            || layerCount == 0 || width == 0 || height == 0 || mipLevels == 0
+            || firstLayer >= impl_->maxImageArrayLayers)
+            return false;
+
+        const auto endLayer = std::min(impl_->maxImageArrayLayers, firstLayer + layerCount);
+        if (endLayer <= firstLayer)
+            return false;
+
+        const auto maxDim = std::max(width, height);
+        const auto fullMips = static_cast<std::uint32_t>(
+            std::floor(std::log2(static_cast<float>(maxDim)))) + 1u;
+        mipLevels = std::min(mipLevels, fullMips);
+
+        if (impl_->assetTextureArray.id)
+            glDeleteTextures_(1, &impl_->assetTextureArray.id);
+        impl_->assetTextureArray = {};
+        impl_->assetTexturesReady = false;
+
+        GLuint textureId{};
+        glCreateTextures_(GL_TEXTURE_2D_ARRAY, 1, &textureId);
+        glTextureStorage3D_(textureId, static_cast<GLsizei>(mipLevels),
+            bc_gl_internal_format(impl_->terrainTextureFormat),
+            static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+            static_cast<GLsizei>(endLayer));
+        glTextureParameteri_(textureId, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTextureParameteri_(textureId, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri_(textureId, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTextureParameteri_(textureId, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+        impl_->assetTextureArray.id = textureId;
+        impl_->assetTexturesReady = true;
+        impl_->assetTextureFirstLayer = firstLayer;
+        impl_->assetTextureEndLayer = endLayer;
+        impl_->assetTextureWidth = width;
+        impl_->assetTextureHeight = height;
+        impl_->assetTextureMipLevels = mipLevels;
+        impl_->assetTextureFormat = impl_->terrainTextureFormat;
         return true;
+    }
+
+    bool OpenGLRenderer::upload_streamed_asset_texture_layer(
+        std::uint32_t layer,
+        const DdsTexture& texture)
+    {
+        if (!ready_ || !impl_->assetTexturesReady
+            || layer < impl_->assetTextureFirstLayer
+            || layer >= impl_->assetTextureEndLayer
+            || !texture.valid || !texture.compressed
+            || texture.vkFormat != impl_->assetTextureFormat
+            || texture.width != impl_->assetTextureWidth
+            || texture.height != impl_->assetTextureHeight
+            || texture.mipData.size() < impl_->assetTextureMipLevels)
+            return false;
+
+        const auto blockBytes = bc_block_bytes(impl_->assetTextureFormat);
+        for (std::uint32_t mip = 0; mip < impl_->assetTextureMipLevels; ++mip)
+        {
+            const auto mipW = std::max(1u, impl_->assetTextureWidth >> mip);
+            const auto mipH = std::max(1u, impl_->assetTextureHeight >> mip);
+            const auto blocksW = std::max(1u, (mipW + 3u) / 4u);
+            const auto blocksH = std::max(1u, (mipH + 3u) / 4u);
+            const auto expectedSize = static_cast<std::size_t>(blocksW) * blocksH * blockBytes;
+            if (texture.mipData[mip].size() != expectedSize)
+                return false;
+        }
+
+        const auto internalFormat = bc_gl_internal_format(impl_->assetTextureFormat);
+        for (std::uint32_t mip = 0; mip < impl_->assetTextureMipLevels; ++mip)
+        {
+            const auto mipW = std::max(1u, impl_->assetTextureWidth >> mip);
+            const auto mipH = std::max(1u, impl_->assetTextureHeight >> mip);
+            const auto& source = texture.mipData[mip];
+            glCompressedTextureSubImage3D_(impl_->assetTextureArray.id,
+                static_cast<GLint>(mip), 0, 0, static_cast<GLint>(layer),
+                static_cast<GLsizei>(mipW), static_cast<GLsizei>(mipH), 1,
+                internalFormat, static_cast<GLsizei>(source.size()), source.data());
+        }
+        return true;
+    }
+
+    std::uint32_t OpenGLRenderer::terrain_texture_width() const
+    {
+        return impl_ ? impl_->terrainTextureWidth : 0u;
+    }
+
+    std::uint32_t OpenGLRenderer::terrain_texture_height() const
+    {
+        return impl_ ? impl_->terrainTextureHeight : 0u;
+    }
+
+    std::uint32_t OpenGLRenderer::terrain_texture_mip_levels() const
+    {
+        return impl_ ? impl_->terrainTextureMipLevels : 0u;
+    }
+
+    std::uint32_t OpenGLRenderer::asset_texture_width() const
+    {
+        return impl_ ? impl_->assetTextureWidth : 0u;
+    }
+
+    std::uint32_t OpenGLRenderer::asset_texture_height() const
+    {
+        return impl_ ? impl_->assetTextureHeight : 0u;
+    }
+
+    std::uint32_t OpenGLRenderer::asset_texture_mip_levels() const
+    {
+        return impl_ ? impl_->assetTextureMipLevels : 0u;
     }
 
     bool OpenGLRenderer::upload_field_lightmaps(const std::vector<DdsTexture>& lightmaps, std::uint32_t sectionCount)
@@ -1555,13 +2156,20 @@ namespace phoenix::renderer
         std::vector<std::uint8_t> buffer(totalBytes, 0);
         std::memcpy(buffer.data(), data.data(), mapBytes);
 
-        auto* tileSizeDst = reinterpret_cast<float*>(buffer.data() + mapBytesPadded);
         for (std::uint32_t i = 0; i < kMaxTileSizes; ++i)
-            tileSizeDst[i] = (i < tileSizeCount && tileSizes) ? std::max(1.0f, tileSizes[i]) : 8.0f;
+        {
+            const float tileSize = (i < tileSizeCount && tileSizes)
+                ? std::max(1.0f, tileSizes[i]) : 8.0f;
+            std::memcpy(buffer.data() + mapBytesPadded + static_cast<std::size_t>(i) * sizeof(float),
+                &tileSize, sizeof(tileSize));
+        }
 
-        auto* splatDst = reinterpret_cast<std::uint32_t*>(buffer.data() + mapBytesPadded + tileSizeBytes);
-        splatDst[0] = alphaMaskLayerFlags;
-        splatDst[1] = std::min(splatLayerCount, kMaxTileSizes);
+        const std::uint32_t splatValues[2]{
+            alphaMaskLayerFlags,
+            std::min(splatLayerCount, kMaxTileSizes),
+        };
+        std::memcpy(buffer.data() + mapBytesPadded + tileSizeBytes,
+            splatValues, sizeof(splatValues));
 
         impl_->terrainMapBuffer = make_static_buffer(buffer.data(), totalBytes);
         glBindBufferBase_(GL_SHADER_STORAGE_BUFFER, 1, impl_->terrainMapBuffer.id);
@@ -1615,8 +2223,125 @@ namespace phoenix::renderer
     void OpenGLRenderer::enter_loading_mode()
     {
         if (!impl_) return;
+        impl_->loadingMode = true;
         impl_->terrainReady = false;
         impl_->objectsReady = false;
+    }
+
+    void OpenGLRenderer::leave_loading_mode()
+    {
+        if (!impl_) return;
+        impl_->loadingMode = false;
+    }
+
+    void OpenGLRenderer::release_world_resources()
+    {
+        if (!impl_) return;
+
+        // glDelete* only retires a name. Storage survives while a VAO, SSBO
+        // binding or texture unit references it, which made map buffers stack
+        // up in the driver across transitions.
+        glFinish_();
+        glBindBufferBase_(GL_SHADER_STORAGE_BUFFER, 1, 0);
+        glBindBufferBase_(GL_SHADER_STORAGE_BUFFER, 3, 0);
+        glBindTextureUnit_(0, 0);
+        glBindTextureUnit_(2, 0);
+        const auto recreateVao = [](GLuint& vao) {
+            if (vao) glDeleteVertexArrays_(1, &vao);
+            glGenVertexArrays_(1, &vao);
+        };
+        recreateVao(impl_->terrainVao);
+        recreateVao(impl_->waterVao);
+        recreateVao(impl_->objectVao);
+        recreateVao(impl_->animatedObjectVao);
+        recreateVao(impl_->botCharacterVao);
+        recreateVao(impl_->effectParticleVao);
+        recreateVao(impl_->monsterCharacterVao);
+        recreateVao(impl_->npcCharacterVao);
+
+        const auto releaseBuffer = [](GlBuffer& buffer) { destroy_gl_buffer(buffer); };
+        releaseBuffer(impl_->terrainVertexBuffer);
+        releaseBuffer(impl_->terrainIndexBuffer);
+        releaseBuffer(impl_->waterVertexBuffer);
+        releaseBuffer(impl_->waterIndexBuffer);
+        releaseBuffer(impl_->objectVertexBuffer);
+        releaseBuffer(impl_->objectIndexBuffer);
+        releaseBuffer(impl_->objectInstanceBuffer);
+        releaseBuffer(impl_->objectIndirectBuffer);
+        releaseBuffer(impl_->animatedObjectVertexBuffer);
+        releaseBuffer(impl_->animatedObjectIndexBuffer);
+        releaseBuffer(impl_->animatedObjectInstanceBuffer);
+        releaseBuffer(impl_->botCharacterVertexBuffer);
+        releaseBuffer(impl_->botCharacterIndexBuffer);
+        releaseBuffer(impl_->botCharacterInstanceBuffer);
+        releaseBuffer(impl_->effectParticleVertexBuffer);
+        releaseBuffer(impl_->effectParticleIndexBuffer);
+        releaseBuffer(impl_->effectParticleInstanceBuffer);
+        releaseBuffer(impl_->monsterCharacterVertexBuffer);
+        releaseBuffer(impl_->monsterCharacterIndexBuffer);
+        releaseBuffer(impl_->npcCharacterVertexBuffer);
+        releaseBuffer(impl_->npcCharacterIndexBuffer);
+        releaseBuffer(impl_->terrainMapBuffer);
+        for (auto& buffer : impl_->monsterCharacterInstanceBuffer) releaseBuffer(buffer);
+        for (auto& buffer : impl_->monsterPaletteBuffer) releaseBuffer(buffer);
+        for (auto& buffer : impl_->npcCharacterInstanceBuffer) releaseBuffer(buffer);
+        for (auto& buffer : impl_->npcPaletteBuffer) releaseBuffer(buffer);
+
+        const auto releaseTexture = [](GlTexture& texture) {
+            if (texture.id) glDeleteTextures_(1, &texture.id);
+            texture = {};
+        };
+        releaseTexture(impl_->terrainTextureArray);
+        releaseTexture(impl_->assetTextureArray);
+        releaseTexture(impl_->lightmapTexture);
+
+        impl_->terrainIndexCount = 0;
+        impl_->waterIndexCount = 0;
+        impl_->terrainVertexBytes = 0;
+        impl_->animatedObjectVertexBytes = 0;
+        impl_->animatedObjectInstanceBytes = 0;
+        impl_->terrainTextureLayerCount = 0;
+        impl_->terrainTextureWidth = 0;
+        impl_->terrainTextureHeight = 0;
+        impl_->terrainTextureMipLevels = 0;
+        impl_->terrainTextureFormat = 0;
+        impl_->terrainTextureCompressed = false;
+        impl_->lightmapSectionCount = 0;
+        impl_->terrainReady = false;
+        impl_->waterReady = false;
+        impl_->objectsReady = false;
+        impl_->animatedObjectsReady = false;
+        impl_->effectParticlesReady = false;
+        impl_->botCharacterReady = false;
+        impl_->botCharacterVisible = false;
+        impl_->monsterCharacterReady = false;
+        impl_->monsterCharacterVisible = false;
+        impl_->monsterCharacterSkinned = false;
+        impl_->npcCharacterReady = false;
+        impl_->npcCharacterVisible = false;
+        impl_->terrainTexturesReady = false;
+        impl_->assetTexturesReady = false;
+        impl_->assetTextureFirstLayer = 0;
+        impl_->assetTextureEndLayer = 0;
+        impl_->assetTextureWidth = 0;
+        impl_->assetTextureHeight = 0;
+        impl_->assetTextureMipLevels = 0;
+        impl_->assetTextureFormat = 0;
+        impl_->terrainMapReady = false;
+        impl_->lightmapReady = false;
+        impl_->objectIndirectCount = 0;
+        impl_->skyConstants[6] = 0.0f;
+        impl_->skyConstants[7] = 0.0f;
+        std::vector<TerrainDrawRange>().swap(impl_->terrainDrawRanges);
+        std::vector<ObjectBatch>().swap(impl_->objectBatches);
+        std::vector<ObjectBatch>().swap(impl_->animatedObjectBatches);
+        std::vector<ObjectBatch>().swap(impl_->botCharacterBatches);
+        std::vector<EffectParticleBatch>().swap(impl_->effectParticleBatches);
+        std::vector<ObjectBatch>().swap(impl_->monsterCharacterBatches);
+        std::vector<ObjectBatch>().swap(impl_->npcCharacterBatches);
+        std::vector<ScreenLabel>().swap(impl_->worldLabels);
+        std::vector<ScreenUiCommand>().swap(impl_->screenUi);
+        glFinish_();
     }
 
     void OpenGLRenderer::set_camera(float x, float y, float z, float yaw, float pitch, float aspect, float farPlane)
@@ -1656,12 +2381,29 @@ namespace phoenix::renderer
         impl_->skyConstants[8] = secondaryCloudLayer != UINT32_MAX ? static_cast<float>(secondaryCloudLayer) : -1.0f;
     }
 
-    void OpenGLRenderer::set_sky_tuning(const float* values, std::uint32_t count)
+    void OpenGLRenderer::set_environment_style(const EnvironmentStyle& style)
     {
-        if (!impl_ || !values) return;
-        const auto copyCount = std::min<std::uint32_t>(count, static_cast<std::uint32_t>(std::size(impl_->skyTuning)));
-        for (std::uint32_t i = 0; i < copyCount; ++i)
-            impl_->skyTuning[i] = values[i];
+        if (!impl_) return;
+        impl_->environmentStyle = style;
+    }
+
+    void OpenGLRenderer::set_terrain_compatibility(bool enabled)
+    {
+        if (!impl_) return;
+        impl_->terrainCompatibility = enabled;
+    }
+
+    void OpenGLRenderer::set_shadows_enabled(bool enabled)
+    {
+        if (!impl_) return;
+        impl_->shadowsEnabled = enabled;
+    }
+
+    bool OpenGLRenderer::set_vsync_enabled(bool enabled)
+    {
+        if (!impl_ || !ready_)
+            return false;
+        return SDL_GL_SetSwapInterval(enabled ? 1 : 0) == 0;
     }
 
     void OpenGLRenderer::set_antialiasing_enabled(bool enabled)
@@ -1705,8 +2447,13 @@ namespace phoenix::renderer
         if (!ready_) return;
         if (impl_->surfaceWidth == 0 || impl_->surfaceHeight == 0) return;
 
-        const bool hasScene = impl_->terrainReady || impl_->objectsReady;
-        const bool uiOnlyFrame = imguiReady_ && imguiFrameStarted_ && !hasScene;
+        // Resource uploads intentionally happen a piece at a time, but the
+        // swapchain must continue to present only the loading image until the
+        // owner explicitly commits the completed world.
+        const bool hasScene = !impl_->loadingMode
+            && (impl_->terrainReady || impl_->objectsReady);
+        const bool uiOnlyFrame = !impl_->loadingMode
+            && !impl_->screenUi.empty() && !hasScene;
 
         glBindFramebuffer_(GL_FRAMEBUFFER, 0);
         glViewport_(0, 0, static_cast<GLsizei>(impl_->surfaceWidth), static_cast<GLsizei>(impl_->surfaceHeight));
@@ -1718,30 +2465,24 @@ namespace phoenix::renderer
             glClear_(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glEnable_(GL_DEPTH_TEST);
 
-            impl_->screenInfo[0] = static_cast<float>(impl_->surfaceWidth);
-            impl_->screenInfo[1] = static_cast<float>(impl_->surfaceHeight);
-            impl_->screenInfo[2] = 1.0f / static_cast<float>(impl_->surfaceWidth);
-            impl_->screenInfo[3] = 1.0f / static_cast<float>(impl_->surfaceHeight);
-
-            float constants[64]{};
+            float constants[kCameraConstantFloatCount]{};
             std::memcpy(constants, impl_->cameraConstants, sizeof(impl_->cameraConstants));
             std::memcpy(constants + 12, impl_->skyConstants, sizeof(impl_->skyConstants));
-            std::memcpy(constants + 28, impl_->skyTuning, sizeof(impl_->skyTuning));
-            std::memcpy(constants + 40, impl_->waterStyle, sizeof(impl_->waterStyle));
-            std::memcpy(constants + 44, impl_->characterShading, sizeof(impl_->characterShading));
-            std::memcpy(constants + 60, impl_->screenInfo, sizeof(impl_->screenInfo));
-            float assetConstants[64]{};
-            std::memcpy(assetConstants, constants, sizeof(float) * 44);
-            std::memcpy(assetConstants + 44, impl_->assetShading, sizeof(impl_->assetShading));
-            std::memcpy(assetConstants + 60, impl_->screenInfo, sizeof(impl_->screenInfo));
+            static_assert(sizeof(EnvironmentStyle) == sizeof(float) * 96u);
+            std::memcpy(constants + 28, &impl_->environmentStyle, sizeof(impl_->environmentStyle));
+            build_directional_shadow_matrix(impl_->shadowMatrix, impl_->cameraConstants,
+                impl_->environmentStyle.lightDirectionEnergy, impl_->cameraConstants[7]);
+            impl_->shadowInfo[0] = impl_->shadowReady && impl_->shadowsEnabled
+                && impl_->environmentStyle.lightDirectionEnergy[3] > 0.01f ? 1.0f : 0.0f;
+            impl_->shadowInfo[3] = impl_->terrainCompatibility ? 1.0f : 0.0f;
+            std::memcpy(constants + 124, impl_->shadowMatrix, sizeof(impl_->shadowMatrix));
+            std::memcpy(constants + 140, impl_->shadowInfo, sizeof(impl_->shadowInfo));
 
             // Every draw call below re-specified its program and re-uploaded the
             // camera UBO even when back-to-back draws share both (e.g. monster then
             // NPC both use skinnedCharacterProgram + `constants`). Track the last
-            // bound program and the last-uploaded constants blob (compared by
-            // identity, since `constants`/`assetConstants` are the only two blobs
-            // used all frame) so repeats become no-ops instead of redundant
-            // glUseProgram/glNamedBufferSubData calls.
+            // bound program and camera upload so repeats become no-ops instead of
+            // redundant glUseProgram/glNamedBufferSubData calls.
             GLuint boundProgram = 0;
             const float* uploadedConstants = nullptr;
             const auto useProgram = [&](GLuint program) {
@@ -1759,6 +2500,105 @@ namespace phoenix::renderer
                 }
             };
 
+            const auto frame = frameIndex_ % kMaxFramesInFlight;
+
+            if (impl_->shadowInfo[0] > 0.5f)
+            {
+                if (impl_->terrainTexturesReady)
+                {
+                    glBindTextureUnit_(0, impl_->terrainTextureArray.id);
+                    glBindSampler_(0, impl_->terrainSampler);
+                }
+                glBindFramebuffer_(GL_FRAMEBUFFER, impl_->shadowFramebuffer);
+                glViewport_(0, 0, static_cast<GLsizei>(Impl::shadowResolution),
+                    static_cast<GLsizei>(Impl::shadowResolution));
+                glClearDepth_(1.0);
+                glClear_(GL_DEPTH_BUFFER_BIT);
+                glEnable_(GL_DEPTH_TEST);
+                glDepthMask_(GL_TRUE);
+                glDisable_(GL_BLEND);
+                glDisable_(GL_MULTISAMPLE);
+                glDisable_(GL_SAMPLE_ALPHA_TO_COVERAGE);
+                set_camera_ubo(impl_->cameraUbo, constants);
+
+                const auto drawRanges = [&](GLuint vao, const std::vector<ObjectBatch>& batches,
+                    GLuint program) {
+                    if (!program || batches.empty()) return;
+                    glUseProgram_(program);
+                    glBindVertexArray_(vao);
+                    for (const auto& batch : batches)
+                    {
+                        if (batch.instanceCount == 0 || batch.indexCount == 0) continue;
+                        glDrawElementsInstancedBaseInstance_(GL_TRIANGLES,
+                            static_cast<GLsizei>(batch.indexCount), GL_UNSIGNED_INT,
+                            (const void*)(static_cast<std::uintptr_t>(batch.firstIndex) * sizeof(std::uint32_t)),
+                            static_cast<GLsizei>(batch.instanceCount), batch.firstInstance);
+                    }
+                };
+                const auto drawIndirect = [&](GLuint vao, const GlBuffer& commands,
+                    std::uint32_t drawCount, GLuint program) {
+                    if (!program || !commands.id || drawCount == 0) return;
+                    glUseProgram_(program);
+                    glBindVertexArray_(vao);
+                    glBindBuffer_(GL_DRAW_INDIRECT_BUFFER, commands.id);
+                    glMultiDrawElementsIndirect_(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr,
+                        static_cast<GLsizei>(drawCount), sizeof(DrawElementsIndirectCommand));
+                    glBindBuffer_(GL_DRAW_INDIRECT_BUFFER, 0);
+                };
+
+                if (impl_->terrainReady)
+                {
+                    glUseProgram_(impl_->shadowTerrainProgram);
+                    glBindVertexArray_(impl_->terrainVao);
+                    if (impl_->terrainDrawRanges.empty())
+                        glDrawElements_(GL_TRIANGLES, static_cast<GLsizei>(impl_->terrainIndexCount), GL_UNSIGNED_INT, nullptr);
+                    else
+                        for (const auto& range : impl_->terrainDrawRanges)
+                            if (range.indexCount > 0)
+                                glDrawElements_(GL_TRIANGLES, static_cast<GLsizei>(range.indexCount), GL_UNSIGNED_INT,
+                                    (const void*)(static_cast<std::uintptr_t>(range.firstIndex) * sizeof(std::uint32_t)));
+                }
+                if (impl_->objectsReady)
+                    drawIndirect(impl_->objectVao, impl_->objectIndirectBuffer,
+                        impl_->objectIndirectCount, impl_->shadowStaticProgram);
+                if (impl_->animatedObjectsReady)
+                    drawRanges(impl_->animatedObjectVao, impl_->animatedObjectBatches, impl_->shadowStaticProgram);
+                if (impl_->characterVisible && impl_->characterReady)
+                {
+                    glUseProgram_(impl_->shadowTerrainProgram);
+                    glBindVertexArray_(impl_->characterVao);
+                    glDrawElements_(GL_TRIANGLES, static_cast<GLsizei>(impl_->characterIndexCount), GL_UNSIGNED_INT, nullptr);
+                }
+                if (impl_->botCharacterVisible && impl_->botCharacterReady)
+                    drawRanges(impl_->botCharacterVao, impl_->botCharacterBatches, impl_->shadowStaticProgram);
+                if (impl_->monsterCharacterVisible && impl_->monsterCharacterReady
+                    && impl_->monsterPaletteBuffer[frame].id)
+                {
+                    glBindBufferBase_(GL_SHADER_STORAGE_BUFFER, 3, impl_->monsterPaletteBuffer[frame].id);
+                    drawRanges(impl_->monsterCharacterVao, impl_->monsterCharacterBatches,
+                        impl_->shadowSkinnedProgram);
+                }
+                if (impl_->npcCharacterVisible && impl_->npcCharacterReady
+                    && impl_->npcPaletteBuffer[frame].id)
+                {
+                    glBindBufferBase_(GL_SHADER_STORAGE_BUFFER, 3, impl_->npcPaletteBuffer[frame].id);
+                    drawRanges(impl_->npcCharacterVao, impl_->npcCharacterBatches,
+                        impl_->shadowSkinnedProgram);
+                }
+
+                glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+                glViewport_(0, 0, static_cast<GLsizei>(impl_->surfaceWidth),
+                    static_cast<GLsizei>(impl_->surfaceHeight));
+                glEnable_(GL_BLEND);
+                if (impl_->antialiasingEnabled)
+                {
+                    glEnable_(GL_MULTISAMPLE);
+                    glEnable_(GL_SAMPLE_ALPHA_TO_COVERAGE);
+                }
+                boundProgram = 0;
+                uploadedConstants = nullptr;
+            }
+
             if (impl_->terrainTexturesReady)
             {
                 glBindTextureUnit_(0, impl_->terrainTextureArray.id);
@@ -1771,6 +2611,10 @@ namespace phoenix::renderer
                 glBindTextureUnit_(3, impl_->debugEffectTextureArray.id);
                 glBindSampler_(3, impl_->debugEffectSampler);
             }
+            glBindTextureUnit_(4, impl_->environmentNoiseTexture);
+            glBindSampler_(4, impl_->terrainSampler);
+            glBindTextureUnit_(5, impl_->shadowDepthTexture);
+            glBindSampler_(5, impl_->shadowSampler);
             glBindBufferBase_(GL_SHADER_STORAGE_BUFFER, 1, impl_->terrainMapBuffer.id);
 
             // sky
@@ -1807,12 +2651,22 @@ namespace phoenix::renderer
                 }
             }
 
-            auto drawStaticBatches = [&](GLuint vao, const std::vector<ObjectBatch>& batches, const float* push)
+            auto drawStaticBatches = [&](GLuint vao, const std::vector<ObjectBatch>& batches,
+                const float* push, const GlBuffer* indirect = nullptr,
+                std::uint32_t indirectCount = 0)
             {
                 if (batches.empty()) return;
                 useProgram(impl_->staticObjectProgram);
                 useCamera(push);
                 glBindVertexArray_(vao);
+                if (indirect && indirect->id && indirectCount > 0)
+                {
+                    glBindBuffer_(GL_DRAW_INDIRECT_BUFFER, indirect->id);
+                    glMultiDrawElementsIndirect_(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr,
+                        static_cast<GLsizei>(indirectCount), sizeof(DrawElementsIndirectCommand));
+                    glBindBuffer_(GL_DRAW_INDIRECT_BUFFER, 0);
+                    return;
+                }
                 for (const auto& batch : batches)
                 {
                     if (batch.instanceCount == 0 || batch.indexCount == 0) continue;
@@ -1822,10 +2676,19 @@ namespace phoenix::renderer
                 }
             };
 
+            // World props intentionally use their own Godot-equivalent
+            // trilinear sampler. Terrain keeps its sharper anisotropic sampler.
+            if (impl_->assetTexturesReady)
+                glBindTextureUnit_(0, impl_->assetTextureArray.id);
+            glBindSampler_(0, impl_->assetSampler);
             if (impl_->objectsReady && impl_->staticObjectProgram)
-                drawStaticBatches(impl_->objectVao, impl_->objectBatches, assetConstants);
+                drawStaticBatches(impl_->objectVao, impl_->objectBatches, constants,
+                    &impl_->objectIndirectBuffer, impl_->objectIndirectCount);
             if (impl_->animatedObjectsReady && impl_->staticObjectProgram)
-                drawStaticBatches(impl_->animatedObjectVao, impl_->animatedObjectBatches, assetConstants);
+                drawStaticBatches(impl_->animatedObjectVao, impl_->animatedObjectBatches, constants);
+            if (impl_->assetTexturesReady)
+                glBindTextureUnit_(0, impl_->terrainTextureArray.id);
+            glBindSampler_(0, impl_->terrainSampler);
 
             if (impl_->characterVisible && impl_->characterReady)
             {
@@ -1838,9 +2701,8 @@ namespace phoenix::renderer
                 && impl_->botCharacterInstanceBuffer.id && !impl_->botCharacterBatches.empty()
                 && impl_->staticObjectProgram)
             {
-                drawStaticBatches(impl_->botCharacterVao, impl_->botCharacterBatches, assetConstants);
+                drawStaticBatches(impl_->botCharacterVao, impl_->botCharacterBatches, constants);
             }
-            const auto frame = frameIndex_ % kMaxFramesInFlight;
             if (impl_->monsterCharacterVisible && impl_->monsterCharacterReady
                 && impl_->monsterCharacterInstanceBuffer[frame].id && !impl_->monsterCharacterBatches.empty()
                 && impl_->monsterCharacterSkinned && impl_->skinnedCharacterProgram
@@ -1937,11 +2799,189 @@ namespace phoenix::renderer
                     glEnable_(GL_SAMPLE_ALPHA_TO_COVERAGE);
                 }
             }
-            if (imguiReady_ && imguiFrameStarted_)
+            if (impl_->worldLabelsReady && impl_->worldLabelProgram
+                && (!impl_->worldLabels.empty() || !impl_->screenUi.empty()))
             {
-                ImGui::Render();
-                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-                imguiFrameStarted_ = false;
+                std::vector<WorldLabelVertex> vertices;
+                vertices.reserve((impl_->worldLabels.size() + impl_->screenUi.size()) * 6u * 32u);
+
+                const auto decode = [](const std::string& text) {
+                    std::vector<std::uint32_t> codepoints;
+                    codepoints.reserve(text.size());
+                    for (std::size_t i = 0; i < text.size();)
+                    {
+                        const auto first = static_cast<std::uint8_t>(text[i++]);
+                        std::uint32_t codepoint = first;
+                        int continuationCount = 0;
+                        if ((first & 0xE0u) == 0xC0u) { codepoint = first & 0x1Fu; continuationCount = 1; }
+                        else if ((first & 0xF0u) == 0xE0u) { codepoint = first & 0x0Fu; continuationCount = 2; }
+                        else if ((first & 0xF8u) == 0xF0u) { codepoint = first & 0x07u; continuationCount = 3; }
+                        for (int j = 0; j < continuationCount && i < text.size(); ++j)
+                        {
+                            const auto next = static_cast<std::uint8_t>(text[i++]);
+                            if ((next & 0xC0u) != 0x80u) { codepoint = '?'; break; }
+                            codepoint = (codepoint << 6u) | (next & 0x3Fu);
+                        }
+                        codepoints.push_back(codepoint >= 32u && codepoint <= 255u ? codepoint : '?');
+                    }
+                    return codepoints;
+                };
+                const auto appendText = [&](const ScreenLabel& label, float offsetX, float offsetY,
+                    const float (&color)[4]) {
+                    const auto codepoints = decode(label.text);
+                    float width = 0.0f;
+                    for (const auto codepoint : codepoints)
+                        width += impl_->worldLabelGlyphs[codepoint - 32u].advance;
+                    float cursorX = std::floor(label.centerX - width * 0.5f + offsetX);
+                    const float baseline = std::floor(label.topY + 13.0f + offsetY);
+                    for (const auto codepoint : codepoints)
+                    {
+                        const auto& glyph = impl_->worldLabelGlyphs[codepoint - 32u];
+                        const float x0 = cursorX + glyph.x0;
+                        const float y0 = baseline + glyph.y0;
+                        const float x1 = cursorX + glyph.x1;
+                        const float y1 = baseline + glyph.y1;
+                        const WorldLabelVertex quad[6]{
+                            { { x0, y0 }, { glyph.u0, glyph.v0 }, { color[0], color[1], color[2], color[3] } },
+                            { { x1, y0 }, { glyph.u1, glyph.v0 }, { color[0], color[1], color[2], color[3] } },
+                            { { x1, y1 }, { glyph.u1, glyph.v1 }, { color[0], color[1], color[2], color[3] } },
+                            { { x0, y0 }, { glyph.u0, glyph.v0 }, { color[0], color[1], color[2], color[3] } },
+                            { { x1, y1 }, { glyph.u1, glyph.v1 }, { color[0], color[1], color[2], color[3] } },
+                            { { x0, y1 }, { glyph.u0, glyph.v1 }, { color[0], color[1], color[2], color[3] } },
+                        };
+                        vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
+                        cursorX += glyph.advance;
+                    }
+                };
+
+                constexpr float outline[4]{ 0.0f, 0.0f, 0.0f, 0.92f };
+                static constexpr float outlineOffsets[4][2]{
+                    { -1.0f, 0.0f }, { 1.0f, 0.0f }, { 0.0f, -1.0f }, { 0.0f, 1.0f }
+                };
+                for (const auto& label : impl_->worldLabels)
+                {
+                    for (const auto& offset : outlineOffsets)
+                        appendText(label, offset[0], offset[1], outline);
+                    const float color[4]{
+                        label.color[0] / 255.0f, label.color[1] / 255.0f,
+                        label.color[2] / 255.0f, label.color[3] / 255.0f
+                    };
+                    appendText(label, 0.0f, 0.0f, color);
+                }
+
+                // PhoenixUI shares this atlas and vertex buffer with native
+                // world labels. Rectangles bypass the atlas; text samples it.
+                // Commands remain in submission order, so later widgets and
+                // combo overlays naturally cover earlier panel contents.
+                const auto commandClip = [&](const ScreenUiCommand& item) {
+                    if (item.clipWidth <= 0.0f || item.clipHeight <= 0.0f)
+                        return std::array<float, 4>{ 0.0f, 0.0f,
+                            static_cast<float>(impl_->surfaceWidth), static_cast<float>(impl_->surfaceHeight) };
+                    return std::array<float, 4>{ item.clipX, item.clipY,
+                        item.clipX + item.clipWidth, item.clipY + item.clipHeight };
+                };
+                const auto appendRectangle = [&](const ScreenUiCommand& item) {
+                    const auto clip = commandClip(item);
+                    const float x0 = std::max(item.x, clip[0]);
+                    const float y0 = std::max(item.y, clip[1]);
+                    const float x1 = std::min(item.x + item.width, clip[2]);
+                    const float y1 = std::min(item.y + item.height, clip[3]);
+                    if (x1 <= x0 || y1 <= y0)
+                        return;
+                    const WorldLabelVertex quad[6]{
+                        { { x0, y0 }, {}, { item.color[0], item.color[1], item.color[2], item.color[3] }, 0.0f },
+                        { { x1, y0 }, {}, { item.color[0], item.color[1], item.color[2], item.color[3] }, 0.0f },
+                        { { x1, y1 }, {}, { item.color[0], item.color[1], item.color[2], item.color[3] }, 0.0f },
+                        { { x0, y0 }, {}, { item.color[0], item.color[1], item.color[2], item.color[3] }, 0.0f },
+                        { { x1, y1 }, {}, { item.color[0], item.color[1], item.color[2], item.color[3] }, 0.0f },
+                        { { x0, y1 }, {}, { item.color[0], item.color[1], item.color[2], item.color[3] }, 0.0f },
+                    };
+                    vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
+                };
+                const auto appendUiText = [&](const ScreenUiCommand& item) {
+                    const auto clip = commandClip(item);
+                    const auto codepoints = decode(item.text);
+                    float cursorX = std::floor(item.x);
+                    const float baseline = std::floor(item.y + 13.0f);
+                    for (const auto codepoint : codepoints)
+                    {
+                        const auto& glyph = impl_->worldLabelGlyphs[codepoint - 32u];
+                        const float originalX0 = cursorX + glyph.x0;
+                        const float originalY0 = baseline + glyph.y0;
+                        const float originalX1 = cursorX + glyph.x1;
+                        const float originalY1 = baseline + glyph.y1;
+                        const float x0 = std::max(originalX0, clip[0]);
+                        const float y0 = std::max(originalY0, clip[1]);
+                        const float x1 = std::min(originalX1, clip[2]);
+                        const float y1 = std::min(originalY1, clip[3]);
+                        if (x1 > x0 && y1 > y0)
+                        {
+                            const float width = std::max(0.0001f, originalX1 - originalX0);
+                            const float height = std::max(0.0001f, originalY1 - originalY0);
+                            const float u0 = glyph.u0 + (glyph.u1 - glyph.u0) * ((x0 - originalX0) / width);
+                            const float v0 = glyph.v0 + (glyph.v1 - glyph.v0) * ((y0 - originalY0) / height);
+                            const float u1 = glyph.u0 + (glyph.u1 - glyph.u0) * ((x1 - originalX0) / width);
+                            const float v1 = glyph.v0 + (glyph.v1 - glyph.v0) * ((y1 - originalY0) / height);
+                            const WorldLabelVertex quad[6]{
+                                { { x0, y0 }, { u0, v0 }, { item.color[0], item.color[1], item.color[2], item.color[3] } },
+                                { { x1, y0 }, { u1, v0 }, { item.color[0], item.color[1], item.color[2], item.color[3] } },
+                                { { x1, y1 }, { u1, v1 }, { item.color[0], item.color[1], item.color[2], item.color[3] } },
+                                { { x0, y0 }, { u0, v0 }, { item.color[0], item.color[1], item.color[2], item.color[3] } },
+                                { { x1, y1 }, { u1, v1 }, { item.color[0], item.color[1], item.color[2], item.color[3] } },
+                                { { x0, y1 }, { u0, v1 }, { item.color[0], item.color[1], item.color[2], item.color[3] } },
+                            };
+                            vertices.insert(vertices.end(), std::begin(quad), std::end(quad));
+                        }
+                        cursorX += glyph.advance;
+                    }
+                };
+                for (const auto& item : impl_->screenUi)
+                {
+                    if (item.kind == ScreenUiCommandKind::Rectangle)
+                        appendRectangle(item);
+                    else
+                        appendUiText(item);
+                }
+
+                if (!vertices.empty())
+                {
+                    const auto bytes = vertices.size() * sizeof(WorldLabelVertex);
+                    if (bytes > impl_->worldLabelVertexBuffer.byteSize)
+                    {
+                        glNamedBufferData_(impl_->worldLabelVertexBuffer.id,
+                            static_cast<GLsizeiptr>(bytes), vertices.data(), GL_DYNAMIC_DRAW);
+                        impl_->worldLabelVertexBuffer.byteSize = bytes;
+                    }
+                    else
+                    {
+                        glNamedBufferSubData_(impl_->worldLabelVertexBuffer.id, 0,
+                            static_cast<GLsizeiptr>(bytes), vertices.data());
+                    }
+                    glDisable_(GL_DEPTH_TEST);
+                    glDepthMask_(GL_FALSE);
+                    glDisable_(GL_MULTISAMPLE);
+                    glDisable_(GL_SAMPLE_ALPHA_TO_COVERAGE);
+                    glBlendFunc_(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    useProgram(impl_->worldLabelProgram);
+                    const float viewport[4]{
+                        static_cast<float>(impl_->surfaceWidth), static_cast<float>(impl_->surfaceHeight), 0.0f, 0.0f
+                    };
+                    glUniform4fv_(0, 1, viewport);
+                    glBindTextureUnit_(0, impl_->worldLabelTexture);
+                    // Unit 0 normally carries the world's mipmapped terrain
+                    // sampler. The label atlas has a single level and must use
+                    // its own texture filtering state or it becomes incomplete.
+                    glBindSampler_(0, 0);
+                    glBindVertexArray_(impl_->worldLabelVao);
+                    glDrawArrays_(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+                    glDepthMask_(GL_TRUE);
+                    glEnable_(GL_DEPTH_TEST);
+                    if (impl_->antialiasingEnabled)
+                    {
+                        glEnable_(GL_MULTISAMPLE);
+                        glEnable_(GL_SAMPLE_ALPHA_TO_COVERAGE);
+                    }
+                }
             }
         }
         else
@@ -1970,12 +3010,6 @@ namespace phoenix::renderer
                 glClearColor_(0.09f, 0.11f, 0.13f, 1.0f);
                 glClear_(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             }
-            if (imguiReady_ && imguiFrameStarted_)
-            {
-                ImGui::Render();
-                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-                imguiFrameStarted_ = false;
-            }
         }
 
         SDL_GL_SwapWindow(impl_->window);
@@ -1987,14 +3021,6 @@ namespace phoenix::renderer
         if (!impl_) return;
         ready_ = false;
 
-        if (imguiReady_)
-        {
-            ImGui_ImplOpenGL3_Shutdown();
-            ImGui_ImplSDL2_Shutdown();
-            ImGui::DestroyContext();
-            imguiReady_ = false;
-        }
-
         auto destroyBuf = [](GlBuffer& b) { if (b.id) glDeleteBuffers_(1, &b.id); b = {}; };
         destroyBuf(impl_->terrainVertexBuffer);
         destroyBuf(impl_->terrainIndexBuffer);
@@ -2003,6 +3029,7 @@ namespace phoenix::renderer
         destroyBuf(impl_->objectVertexBuffer);
         destroyBuf(impl_->objectIndexBuffer);
         destroyBuf(impl_->objectInstanceBuffer);
+        destroyBuf(impl_->objectIndirectBuffer);
         destroyBuf(impl_->animatedObjectVertexBuffer);
         destroyBuf(impl_->animatedObjectIndexBuffer);
         destroyBuf(impl_->animatedObjectInstanceBuffer);
@@ -2019,6 +3046,7 @@ namespace phoenix::renderer
         destroyBuf(impl_->effectParticleVertexBuffer);
         destroyBuf(impl_->effectParticleIndexBuffer);
         destroyBuf(impl_->effectParticleInstanceBuffer);
+        destroyBuf(impl_->worldLabelVertexBuffer);
         for (auto& b : impl_->monsterCharacterInstanceBuffer) destroyBuf(b);
         for (auto& b : impl_->monsterPaletteBuffer) destroyBuf(b);
         for (auto& b : impl_->npcCharacterInstanceBuffer) destroyBuf(b);
@@ -2034,27 +3062,36 @@ namespace phoenix::renderer
         destroyVao(impl_->monsterCharacterVao);
         destroyVao(impl_->npcCharacterVao);
         destroyVao(impl_->effectParticleVao);
+        destroyVao(impl_->worldLabelVao);
         destroyVao(impl_->emptyVao);
 
         if (impl_->cameraUbo) glDeleteBuffers_(1, &impl_->cameraUbo);
 
         if (impl_->terrainTextureArray.id) glDeleteTextures_(1, &impl_->terrainTextureArray.id);
+        if (impl_->assetTextureArray.id) glDeleteTextures_(1, &impl_->assetTextureArray.id);
         if (impl_->debugEffectTextureArray.id) glDeleteTextures_(1, &impl_->debugEffectTextureArray.id);
         if (impl_->lightmapTexture.id) glDeleteTextures_(1, &impl_->lightmapTexture.id);
         if (impl_->previewTexture) glDeleteTextures_(1, &impl_->previewTexture);
-        for (auto& icon : impl_->imguiIconTextures)
-            if (icon.texture) glDeleteTextures_(1, &icon.texture);
-
+        if (impl_->environmentNoiseTexture) glDeleteTextures_(1, &impl_->environmentNoiseTexture);
+        if (impl_->shadowDepthTexture) glDeleteTextures_(1, &impl_->shadowDepthTexture);
+        if (impl_->worldLabelTexture) glDeleteTextures_(1, &impl_->worldLabelTexture);
         if (impl_->terrainSampler) glDeleteSamplers_(1, &impl_->terrainSampler);
+        if (impl_->assetSampler) glDeleteSamplers_(1, &impl_->assetSampler);
         if (impl_->debugEffectSampler) glDeleteSamplers_(1, &impl_->debugEffectSampler);
         if (impl_->lightmapSampler) glDeleteSamplers_(1, &impl_->lightmapSampler);
+        if (impl_->shadowSampler) glDeleteSamplers_(1, &impl_->shadowSampler);
+        if (impl_->shadowFramebuffer) glDeleteFramebuffers_(1, &impl_->shadowFramebuffer);
 
         auto destroyProg = [](GLuint& p) { if (p) glDeleteProgram_(p); p = 0; };
         destroyProg(impl_->terrainProgram);
         destroyProg(impl_->staticObjectProgram);
         destroyProg(impl_->skinnedCharacterProgram);
         destroyProg(impl_->effectParticleProgram);
+        destroyProg(impl_->worldLabelProgram);
         destroyProg(impl_->skyProgram);
+        destroyProg(impl_->shadowTerrainProgram);
+        destroyProg(impl_->shadowStaticProgram);
+        destroyProg(impl_->shadowSkinnedProgram);
 
         delete impl_;
         impl_ = nullptr;

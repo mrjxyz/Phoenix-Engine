@@ -1,4 +1,5 @@
 #include "character/npc_manager.h"
+#include "world/coordinate_conversion.h"
 
 #include "app/loading_scheduler.h"
 #include "assets/data_index.h"
@@ -21,11 +22,10 @@ namespace phoenix::character
     namespace
     {
         constexpr float kNpcScale = 0.95f;
-        // Animation-LOD distance tiers (squared, world units): within near -> full
-        // 60/s pose rate; within mid -> 30/s; beyond -> 15/s. Coarser rates let
-        // more distant entities share one skinning job.
-        constexpr float kAnimLodNearSq = 25.0f * 25.0f;
-        constexpr float kAnimLodMidSq = 55.0f * 55.0f;
+        // Aggressive default animation LOD, matching the creature profile used
+        // by Compatibility while keeping nearby NPC animation fully fluid.
+        constexpr float kAnimLodNearSq = 15.0f * 15.0f;
+        constexpr float kAnimLodMidSq = 35.0f * 35.0f;
         constexpr float kAniFramesPerSecond = 30.0f;
         constexpr float kAnimationBlendDuration = 0.12f;
         constexpr float kOneShotBlendDuration = 0.25f;
@@ -236,32 +236,6 @@ namespace phoenix::character
             return { m.m[3][0], m.m[3][1], m.m[3][2] };
         }
 
-        Vec3 transform_point(const Mat4& m, Vec3 v)
-        {
-            return {
-                m.m[0][0] * v.x + m.m[1][0] * v.y + m.m[2][0] * v.z + m.m[3][0],
-                m.m[0][1] * v.x + m.m[1][1] * v.y + m.m[2][1] * v.z + m.m[3][1],
-                m.m[0][2] * v.x + m.m[1][2] * v.y + m.m[2][2] * v.z + m.m[3][2],
-            };
-        }
-
-        Vec3 transform_normal(const Mat4& m, Vec3 v)
-        {
-            return {
-                m.m[0][0] * v.x + m.m[1][0] * v.y + m.m[2][0] * v.z,
-                m.m[0][1] * v.x + m.m[1][1] * v.y + m.m[2][1] * v.z,
-                m.m[0][2] * v.x + m.m[1][2] * v.y + m.m[2][2] * v.z,
-            };
-        }
-
-        Vec3 normalize_vec3(Vec3 v)
-        {
-            const float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-            if (len <= 0.0001f)
-                return {};
-            return { v.x / len, v.y / len, v.z / len };
-        }
-
         Quat sample_rotation(const world::CharacterAnimationBone& bone, float frame)
         {
             if (bone.rotationFrames.empty())
@@ -452,6 +426,28 @@ namespace phoenix::character
         }
 
         {
+            // Phoenix-Godot's compact NPC catalog carries the canonical name
+            // keyed by the same (npc_type, npc_type_id) pair used by .svmap.
+            // Overlay names only; extracted visual/model metadata stays local.
+            std::unordered_map<std::uint64_t, std::string> canonicalNames;
+            if (auto names = phoenix::assets::open_ifstream(root / "catalog.txt"))
+            {
+                std::string line;
+                std::getline(names, line);
+                while (std::getline(names, line))
+                {
+                    if (line.empty())
+                        continue;
+                    const auto row = split_csv_line(line);
+                    if (row.size() < 7 || row[6].empty())
+                        continue;
+                    const auto type = parse_u32(row[2]);
+                    const auto typeId = parse_u32(row[4]);
+                    const std::uint64_t key = (static_cast<std::uint64_t>(type) << 32) | typeId;
+                    canonicalNames.insert_or_assign(key, row[6]);
+                }
+            }
+
             auto file = phoenix::assets::open_ifstream(root / "npcdata.csv");
             if (!file)
             {
@@ -475,14 +471,15 @@ namespace phoenix::character
                 entry.npcTypeName = row[3];
                 entry.npcTypeId = parse_u32(row[4]);
                 entry.modelIndex = parse_u32(row[5]);
-                entry.name = row[6];
+                const std::uint64_t typeKey =
+                    (static_cast<std::uint64_t>(entry.npcType) << 32) | entry.npcTypeId;
+                const auto canonical = canonicalNames.find(typeKey);
+                entry.name = canonical != canonicalNames.end() ? canonical->second : row[6];
                 entry.label = entry.name + "  [" + entry.npcId + " / model " + std::to_string(entry.modelIndex) + "]";
                 if (visualRows_.contains(entry.modelIndex))
                 {
                     // svmap stores (NpcType, NpcId); npcdata's npc_type/npc_type_id
                     // are that pair. Key the catalog by it so map placements resolve.
-                    const std::uint64_t typeKey =
-                        (static_cast<std::uint64_t>(entry.npcType) << 32) | entry.npcTypeId;
                     catalogByTypeKey_.emplace(typeKey, catalog_.size());
                     catalog_.push_back(std::move(entry));
                 }
@@ -541,6 +538,8 @@ namespace phoenix::character
         std::uint32_t textureSlotReserve,
         phoenix::renderer::OpenGLRenderer& renderer)
     {
+        for (auto& [_, load] : visualLoads_)
+            if (load.valid()) load.wait();
         placements_.clear();
         streamedPlacements_ = 0;
         mapDataRoot_ = dataRoot;
@@ -603,13 +602,13 @@ namespace phoenix::character
                 Waypoint out{};
                 // Raw map-space X/Z -> engine/world space (matches WLD instances).
                 // Y is kept exactly as authored: svmap NPCs are never terrain-clamped.
-                out.x = wp.x - halfMap;
+                out.x = phoenix::world::source_to_world_x(wp.x, halfMap);
                 out.y = wp.y;
-                out.z = wp.z - halfMap;
+                out.z = phoenix::world::source_to_world_z(wp.z, halfMap);
                 // svmap yaw points 180° opposite to the engine's NPC facing (the
                 // instance basis uses the reverse forward convention), so NPCs
                 // faced away from their authored direction — flip by pi.
-                out.yaw = wp.yaw + 3.14159265358979323846f;
+                out.yaw = -wp.yaw + 3.14159265358979323846f;
                 mp.waypoints.push_back(out);
             }
             placements_.push_back(std::move(mp));
@@ -681,6 +680,9 @@ namespace phoenix::character
                         ++streamedPlacements_;
                         continue;
                     }
+                    plan.targetTextureWidth = renderer.terrain_texture_width();
+                    plan.targetTextureHeight = renderer.terrain_texture_height();
+                    plan.targetTextureMipLevels = renderer.terrain_texture_mip_levels();
                     if (workerPool)
                     {
                         visualLoads_.emplace(model,
@@ -761,15 +763,24 @@ namespace phoenix::character
 
     void NpcManager::clear(phoenix::renderer::OpenGLRenderer& renderer)
     {
+        // A dropped future does not cancel its LoadingScheduler task. Drain
+        // every map-owned parse so decoded meshes/textures die at this boundary.
+        for (auto& [_, load] : visualLoads_)
+            if (load.valid()) load.wait();
+        visualLoads_.clear();
+        visualLoads_.rehash(0);
+
         placements_.clear();
         placements_.shrink_to_fit();
         streamedPlacements_ = 0;
-        // In-flight worker parses (if any) complete harmlessly; their results are
-        // self-contained and simply discarded when the futures are dropped.
-        visualLoads_.clear();
-        failedModels_.clear();
         active_.clear();
         active_.shrink_to_fit();
+        visuals_.clear();
+        visuals_.rehash(0);
+        failedModels_.clear();
+        failedModels_.rehash(0);
+        labels_.clear();
+        labels_.shrink_to_fit();
         renderVertices_.clear();
         renderVertices_.shrink_to_fit();
         renderIndices_.clear();
@@ -778,6 +789,25 @@ namespace phoenix::character
         instances_.shrink_to_fit();
         instanceBatches_.clear();
         instanceBatches_.shrink_to_fit();
+        paletteFloats_.clear();
+        paletteFloats_.shrink_to_fit();
+        modelIndexOffset_.clear();
+        modelIndexOffset_.rehash(0);
+        textureSlotByPath_.clear();
+        textureSlotByPath_.rehash(0);
+        slotRefcount_.clear();
+        slotRefcount_.rehash(0);
+        textureKeyBySlot_.clear();
+        textureKeyBySlot_.rehash(0);
+        freeTextureSlots_.clear();
+        freeTextureSlots_.shrink_to_fit();
+        modelLastUsedFrame_.clear();
+        modelLastUsedFrame_.rehash(0);
+        mapDataRoot_.clear();
+        mapTextureBaseSlot_ = 0;
+        mapTextureReserve_ = 0;
+        nextTextureSlot_ = 0;
+        frameCounter_ = 0;
         visibleCount_ = 0;
         renderer.update_npc_skinned_instances(instances_, instanceBatches_);
         renderer.set_npc_skinned_visible(false);
@@ -984,6 +1014,9 @@ namespace phoenix::character
         VisualLoadPlan plan;
         if (!plan_visual(dataRoot, entry, textureBaseSlot, textureSlotReserve, plan))
             return nullptr;
+        plan.targetTextureWidth = renderer.terrain_texture_width();
+        plan.targetTextureHeight = renderer.terrain_texture_height();
+        plan.targetTextureMipLevels = renderer.terrain_texture_mip_levels();
         auto parsed = parse_visual(plan);
         if (!parsed)
         {
@@ -1020,8 +1053,22 @@ namespace phoenix::character
             const std::uint32_t textureSlot = part.textureSlot;
             const bool alphaCutout = phoenix::renderer::dds_file_has_alpha_cutout(part.texturePath);
             if (part.decodeTexture)
-                next.pendingTextureUploads.push_back(
-                    { textureSlot, phoenix::renderer::load_dds(part.texturePath) });
+            {
+                auto texture = phoenix::renderer::load_dds(part.texturePath);
+                const bool canonical = texture.valid && texture.compressed
+                    && texture.vkFormat == phoenix::renderer::kDdsFormatBc3UnormBlock
+                    && texture.width == plan.targetTextureWidth
+                    && texture.height == plan.targetTextureHeight
+                    && texture.mipData.size() >= plan.targetTextureMipLevels;
+                if (!canonical && plan.targetTextureWidth > 0
+                    && plan.targetTextureHeight > 0 && plan.targetTextureMipLevels > 0)
+                {
+                    phoenix::renderer::convert_texture_to_bc3(texture,
+                        plan.targetTextureWidth, plan.targetTextureHeight,
+                        plan.targetTextureMipLevels);
+                }
+                next.pendingTextureUploads.push_back({ textureSlot, std::move(texture) });
+            }
             next.textureSlots.push_back(textureSlot);
 
             const auto baseVertex = static_cast<std::uint32_t>(next.skinnedBind.size());
@@ -1547,7 +1594,7 @@ namespace phoenix::character
         struct PoseKey { std::uint32_t model; std::size_t anim; std::int32_t tier; std::int32_t bucket; std::uint32_t baseBone; };
         static std::vector<PoseKey> poseKeys;
         poseKeys.clear();
-        struct VisInst { std::uint32_t model; phoenix::renderer::ObjectInstance inst; };
+        struct VisInst { std::uint32_t model{}; phoenix::renderer::ObjectInstance inst; };
         static std::vector<VisInst> vis;
         vis.clear();
         // Pass 1 (serial): cull, advance animation, dedup poses. Each unique pose
@@ -1602,7 +1649,7 @@ namespace phoenix::character
                 const float dx = npc.x - view.x, dy = npc.y - view.y, dz = npc.z - view.z;
                 const float d2 = dx * dx + dy * dy + dz * dz;
                 const float rate = d2 < kAnimLodNearSq ? 60.0f
-                    : (d2 < kAnimLodMidSq ? 30.0f : 15.0f);
+                    : (d2 < kAnimLodMidSq ? 20.0f : 10.0f);
                 tier = d2 < kAnimLodNearSq ? 0 : (d2 < kAnimLodMidSq ? 1 : 2);
                 bucket = static_cast<std::int32_t>(std::lround(npc.animationSeconds * rate));
                 for (const auto& k : poseKeys)

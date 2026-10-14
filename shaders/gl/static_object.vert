@@ -77,20 +77,18 @@ void main()
     float cp = camera.precomputedTrig.z;
     float sp = camera.precomputedTrig.w;
 
-    float cameraX = cy * delta.x - sy * delta.z;
+    float cameraX = -cy * delta.x + sy * delta.z;
     float yawZ = sy * delta.x + cy * delta.z;
     float cameraY = cp * delta.y - sp * yawZ;
     float cameraZ = sp * delta.y + cp * yawZ;
-    float nearPlane = 2.0;
+    float nearPlane = 0.05;
 
-    vec3 lightDir = vec3(-0.30, 0.68, -0.67);
-    float nDotL = dot(worldNormal, lightDir);
-    float lit = clamp(nDotL, 0.0, 1.0) * camera.tuning1.y + camera.tuning1.x;
+    float lit = 1.0;
 
     float fogStart = camera.fogDistances.x;
     float fogEnd = max(fogStart + 1.0, camera.fogDistances.y);
     float fogLinear = clamp((cameraZ - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
-    float fogFactor = 1.0 - exp(-fogLinear * fogLinear * 5.0);
+    float fogFactor = fogLinear * fogLinear;
 
     float ndcZ = cameraZ * farPlane / (farPlane - nearPlane) - nearPlane * farPlane / (farPlane - nearPlane);
     float glZ = 2.0 * ndcZ - cameraZ;
